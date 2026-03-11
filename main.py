@@ -393,12 +393,12 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
         existing_dict = dict(existing) if existing else None
 
         # City: Claude detects first, fallback to keyword, then unknown
-        ai_city = ai.get("city", "unknown") if ai else "unknown"
-        city = ai_city if ai_city in ["chennai","hyderabad"] else detect_city_from_message(msg, contact)
-
         ai = await claude_extract(msg, contact, conv_ctx, has_image, existing_dict)
         if not ai:
             ai = {}
+
+        ai_city = ai.get("city", "unknown")
+        city = ai_city if ai_city in ["chennai","hyderabad"] else detect_city_from_message(msg, contact)
 
         event_date        = ai.get("event_date")             or parse_date_from_message(msg)
         cake_type         = ai.get("cake_type")              or parse_cake_type(msg)
