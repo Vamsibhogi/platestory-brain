@@ -401,7 +401,7 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
 
         # --- THE BUG FIX: CALL AI BEFORE ACCESSING IT ---
         ai = await claude_extract(msg, contact, conv_ctx, has_image, existing_dict)
-        if not ai:
+        if not isinstance(ai, dict) or not ai:
             ai = {}
 
         ai_city = ai.get("city", "unknown")
