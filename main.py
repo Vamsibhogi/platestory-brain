@@ -17,7 +17,8 @@ security = HTTPBearer(auto_error=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 AGENT_SECRET   = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
-DB_PATH        = os.getenv("DB_PATH", "platestory.db")
+# UPDATED: Path for Railway Volume persistence
+DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db") 
 ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -52,6 +53,11 @@ CAKE_KEYWORDS = {
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def get_db():
+    # Ensure directory exists for the volume
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -317,6 +323,8 @@ def login(req: LoginRequest):
     return {"token": token, "role": user["role"], "name": user["name"],
             "city": dict(user).get("city", "chennai")}
 
+# ... [Registration and User endpoints remain the same] ...
+
 @app.post("/api/v1/auth/register")
 def register(req: RegisterRequest, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
@@ -385,20 +393,21 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
         if not msg or not contact or len(msg) < 3: continue
         if contact in ["Add status","Calls","Chats","Status","WhatsApp","Camera"]: continue
 
-        # Check if lead exists — pass existing data to Claude for continuity
         existing = conn.execute(
             "SELECT * FROM extractions WHERE contact_name=? ORDER BY captured_at DESC LIMIT 1",
             (contact,)
         ).fetchone()
         existing_dict = dict(existing) if existing else None
 
-        # City: Claude detects first, fallback to keyword, then unknown
+        # --- THE BUG FIX: CALL AI BEFORE ACCESSING IT ---
         ai = await claude_extract(msg, contact, conv_ctx, has_image, existing_dict)
         if not ai:
             ai = {}
 
         ai_city = ai.get("city", "unknown")
+        # Logic: Claude detects city from message first, fallback to keyword matching
         city = ai_city if ai_city in ["chennai","hyderabad"] else detect_city_from_message(msg, contact)
+        # -----------------------------------------------
 
         event_date        = ai.get("event_date")             or parse_date_from_message(msg)
         cake_type         = ai.get("cake_type")              or parse_cake_type(msg)
@@ -413,7 +422,6 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
         conv_status       = ai.get("conversion_status", "open")
         drop_detected     = ai.get("drop_detected", False)
 
-        # If image received, ensure funnel stage reflects that
         if has_image and funnel_stage == "enquiry":
             funnel_stage = "ref_shared"
 
@@ -430,7 +438,6 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
              order_value, suggested_reply, 1 if has_image else 0, city,
              conv_status, now_iso, now_iso))
 
-        # Store pattern for learning
         if existing_dict and existing_dict.get("lead_score") != lead_score:
             conn.execute("""INSERT INTO conversion_patterns (pattern_type, pattern_data, outcome, created_at)
                 VALUES (?,?,?,?)""", (
@@ -440,7 +447,6 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
 
         results.append({"contact": contact, "score": lead_score, "city": city})
 
-        # Email alerts
         if lead_score == "HOT" and (not existing_dict or existing_dict.get("lead_score") != "HOT"):
             alerts.append(f"HOT LEAD: {contact} ({city})\nMessage: {msg[:150]}\nNext: {next_action}")
         if drop_detected:
@@ -456,6 +462,8 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
         background_tasks.add_task(send_email_alert, f"{len(alerts)} alert(s)", body_text)
 
     return {"status": "ok", "processed": len(results), "results": results}
+
+# ... [Remaining dashboard and action endpoints stay the same] ...
 
 @app.get("/api/v1/extractions/recent")
 def recent_extractions(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -474,8 +482,6 @@ def recent_extractions(credentials: HTTPAuthorizationCredentials = Depends(secur
     conn.close()
     return [dict(r) for r in rows]
 
-# ── DASHBOARD ──────────────────────────────────────────────────────────────────
-
 @app.get("/api/v1/dashboard")
 def dashboard(user=Depends(get_current_user), city: str = None):
     conn = get_db()
@@ -484,7 +490,6 @@ def dashboard(user=Depends(get_current_user), city: str = None):
     is_admin = user["role"] == "admin"
     email = user["email"]
 
-    # City filter — admin can see all or filter by city; salesperson sees their city
     city_filter = ""
     if city and city in CITIES:
         city_filter = f"AND city='{city}'"
@@ -505,7 +510,6 @@ def dashboard(user=Depends(get_current_user), city: str = None):
     forecast_low  = int((hot_count * 5500) + (warm_count * 5500 * 0.3))
     forecast_high = int((hot_count * 8000) + (warm_count * 8000 * 0.5))
 
-    # City slot usage
     city_slots = {}
     for city_key, city_info in CITIES.items():
         used = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE funnel_stage='confirmed' AND city='{city_key}'").fetchone()["c"]
@@ -586,8 +590,6 @@ def dashboard(user=Depends(get_current_user), city: str = None):
         "users":             [dict(r) for r in users]
     }
 
-# ── LEAD ACTIONS ───────────────────────────────────────────────────────────────
-
 @app.post("/api/v1/leads/{lead_id}/followup")
 def mark_followup(lead_id: int, user=Depends(get_current_user)):
     conn = get_db()
@@ -656,18 +658,14 @@ def delete_lead(lead_id: int, user=Depends(get_current_user)):
     conn.close()
     return {"status": "deleted"}
 
-# ── INTELLIGENCE ───────────────────────────────────────────────────────────────
-
 @app.get("/api/v1/intelligence")
 def intelligence(user=Depends(get_current_user)):
     conn = get_db()
-    # Conversion rate
     total = conn.execute("SELECT COUNT(*) as c FROM extractions").fetchone()["c"]
     converted = conn.execute("SELECT COUNT(*) as c FROM extractions WHERE conversion_status='converted'").fetchone()["c"]
     dropped = conn.execute("SELECT COUNT(*) as c FROM extractions WHERE conversion_status='dropped'").fetchone()["c"]
     conv_rate = round((converted / total * 100), 1) if total > 0 else 0
 
-    # Best performing cake types
     top_cakes = conn.execute("""
         SELECT cake_type, COUNT(*) as total,
                SUM(CASE WHEN conversion_status='converted' THEN 1 ELSE 0 END) as converted
@@ -675,10 +673,6 @@ def intelligence(user=Depends(get_current_user)):
         GROUP BY cake_type ORDER BY converted DESC LIMIT 5
     """).fetchall()
 
-    # Average time to convert (days)
-    patterns = conn.execute("SELECT pattern_data, outcome FROM conversion_patterns LIMIT 100").fetchall()
-
-    # Hot leads at risk (HOT but no followup in 2 hours)
     two_hours_ago = (datetime.utcnow() - timedelta(hours=2)).isoformat()
     at_risk = conn.execute("""
         SELECT contact_name, city, captured_at, next_action, suggested_reply
@@ -688,7 +682,6 @@ def intelligence(user=Depends(get_current_user)):
         ORDER BY captured_at ASC LIMIT 10
     """, (two_hours_ago,)).fetchall()
 
-    # City performance
     city_perf = conn.execute("""
         SELECT city, COUNT(*) as total,
                SUM(CASE WHEN conversion_status='converted' THEN 1 ELSE 0 END) as converted,
