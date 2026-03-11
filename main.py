@@ -1,496 +1,400 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+"""
+Platestory Central Brain — FastAPI Backend
+"""
+
+import os
+import asyncio
+from datetime import datetime, timedelta
+from typing import Optional, List
+from contextlib import asynccontextmanager
+
+import httpx
+import anthropic
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import List, Optional
-import sqlite3, os, re, secrets, hashlib, json
-try:
-    import anthropic
-    CLAUDE_AVAILABLE = True
-except ImportError:
-    CLAUDE_AVAILABLE = False
-from datetime import datetime, date, timedelta
+from pydantic import BaseModel, Field
+from sqlmodel import Field as SQLField, Session, SQLModel, create_engine, select
+from dotenv import load_dotenv
 
-app = FastAPI(title="Platestory AIR 6")
-security = HTTPBearer(auto_error=False)
+load_dotenv()
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///platestory_brain.db")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+KOMMO_API_URL = os.getenv("KOMMO_API_URL")
+KOMMO_ACCESS_TOKEN = os.getenv("KOMMO_ACCESS_TOKEN")
+AGENT_SECRET = os.getenv("AGENT_SECRET", "change-this-in-production")
 
-AGENT_SECRET = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
-DB_PATH = os.getenv("DB_PATH", "platestory.db")
-ADMIN_EMAIL = "vamsi.bhogi@platestory.in"
-
-MONTH_MAP = {
-    "jan":1,"january":1,"feb":2,"february":2,"mar":3,"march":3,
-    "apr":4,"april":4,"may":5,"jun":6,"june":6,"jul":7,"july":7,
-    "aug":8,"august":8,"sep":9,"sept":9,"september":9,
-    "oct":10,"october":10,"nov":11,"november":11,"dec":12,"december":12
-}
-
-CAKE_KEYWORDS = {
-    "wedding": ["wedding","shaadi","vivah","marriage","bride","groom"],
-    "birthday": ["birthday","bday","b-day","janmdin","kids birthday","friends birthday",
-                 "wife birthday","husband birthday","baby birthday","daughter birthday",
-                 "son birthday","mom birthday","dad birthday","sister birthday","brother birthday"],
-    "anniversary": ["anniversary","anniv"],
-    "baby_shower": ["baby shower","babyshower","godh bharai"],
-    "engagement": ["engagement","roka","ring ceremony","sagai"],
-    "custom": ["custom cake","theme cake","designer cake","profit","celebration",
-               "corporate","office","launch","milestone","farewell","retirement"]
-}
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
-        role TEXT DEFAULT 'salesperson',
-        name TEXT,
-        created_at TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY,
-        email TEXT NOT NULL,
-        role TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS extractions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        salesperson_email TEXT,
-        contact_name TEXT,
-        message TEXT,
-        event_date TEXT,
-        cake_type TEXT,
-        lead_score TEXT,
-        funnel_stage TEXT DEFAULT 'enquiry',
-        assigned_to TEXT,
-        follow_up_done INTEGER DEFAULT 0,
-        follow_up_at TEXT,
-        notes TEXT,
-        next_action TEXT,
-        conversion_probability TEXT,
-        business_vertical TEXT,
-        estimated_order_value TEXT,
-        captured_at TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS follow_ups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        extraction_id INTEGER,
-        done_by TEXT,
-        done_at TEXT,
-        notes TEXT
-    )""")
-    conn.commit()
-
-    # Create admin account if not exists
-    existing = conn.execute("SELECT * FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
-    if not existing:
-        conn.execute("INSERT INTO users (email, password_hash, role, name, created_at) VALUES (?,?,?,?,?)",
-            (ADMIN_EMAIL, hash_password("platestory@2025"), "admin", "Vamsi", datetime.utcnow().isoformat()))
-        conn.commit()
-    conn.close()
-
-init_db()
-
-def parse_date_from_message(message: str) -> Optional[str]:
-    msg = message.lower()
-    msg = re.sub(r'(\d+)(st|nd|rd|th)\b', r'\1', msg)
-    p1 = re.compile(r'(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)')
-    p2 = re.compile(r'(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})')
-    p3 = re.compile(r'(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?')
-    day, month, year = None, None, None
-    today = datetime.today()
-    m = p1.search(msg)
-    if m:
-        day, month = int(m.group(1)), MONTH_MAP.get(m.group(2)[:3])
-    else:
-        m = p2.search(msg)
-        if m:
-            month, day = MONTH_MAP.get(m.group(1)[:3]), int(m.group(2))
-        else:
-            m = p3.search(msg)
-            if m:
-                day, month = int(m.group(1)), int(m.group(2))
-                year = int(m.group(3)) if m.group(3) else None
-    if day and month:
-        if not year:
-            year = today.year
-            try:
-                if date(year, month, day) < today.date(): year += 1
-            except: return None
-        try: return date(year, month, day).isoformat()
-        except: return None
-    return None
-
-def parse_cake_type(message: str) -> Optional[str]:
-    msg = message.lower()
-    for cake_type, keywords in CAKE_KEYWORDS.items():
-        if any(kw in msg for kw in keywords): return cake_type
-    return None
-
-def parse_lead_score(message: str) -> str:
-    msg = message.lower()
-    if any(w in msg for w in ["urgent","asap","today","tomorrow","this week","confirmed","book","advance"]): return "HOT"
-    if any(w in msg for w in ["maybe","will think","let me check","not sure","budget issue","too expensive","costly"]): return "COLD"
-    return "WARM"
-
-def parse_funnel_stage(message: str) -> str:
-    msg = message.lower()
-    if any(w in msg for w in ["paid","advance","payment done","transferred","upi","gpay","confirmed"]): return "confirmed"
-    if any(w in msg for w in ["how much","price","cost","rate","charges","quote","budget"]): return "quoted"
-    if any(w in msg for w in ["reference","ref image","like this","similar to","design","theme","colour","color","flavor","flavour"]): return "ref_shared"
-    return "enquiry"
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials: raise HTTPException(status_code=401, detail="Not authenticated")
-    conn = get_db()
-    session = conn.execute("SELECT * FROM sessions WHERE token=?", (credentials.credentials,)).fetchone()
-    conn.close()
-    if not session: raise HTTPException(status_code=401, detail="Invalid or expired session")
-    return dict(session)
-
-# ── AUTH ENDPOINTS ────────────────────────────────────────────────────────────
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-class RegisterRequest(BaseModel):
-    email: str
-    password: str
-    name: str
-
-@app.post("/api/v1/auth/login")
-def login(req: LoginRequest):
-    if not req.email.endswith("@platestory.in"):
-        raise HTTPException(status_code=403, detail="Only @platestory.in emails allowed")
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (req.email,)).fetchone()
-    if not user or user["password_hash"] != hash_password(req.password):
-        conn.close()
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = secrets.token_hex(32)
-    conn.execute("INSERT INTO sessions (token, email, role, created_at) VALUES (?,?,?,?)",
-        (token, req.email, user["role"], datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return {"token": token, "role": user["role"], "name": user["name"]}
-
-@app.post("/api/v1/auth/register")
-def register(req: RegisterRequest, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403, detail="Admin only")
-    if not req.email.endswith("@platestory.in"):
-        raise HTTPException(status_code=400, detail="Only @platestory.in emails allowed")
-    conn = get_db()
-    try:
-        conn.execute("INSERT INTO users (email, password_hash, role, name, created_at) VALUES (?,?,?,?,?)",
-            (req.email, hash_password(req.password), "salesperson", req.name, datetime.utcnow().isoformat()))
-        conn.commit()
-    except: raise HTTPException(status_code=400, detail="Email already exists")
-    finally: conn.close()
-    return {"status": "ok"}
-
-@app.get("/api/v1/auth/me")
-def me(user=Depends(get_current_user)):
-    return user
-
-# ── EXTRACTIONS ───────────────────────────────────────────────────────────────
-
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-async def claude_extract(message: str, contact_name: str) -> dict:
-    """Use Claude to extract lead info. Falls back to regex if unavailable."""
-    if not CLAUDE_AVAILABLE or not ANTHROPIC_API_KEY:
-        return {}
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        prompt = f"""You are a sales intelligence assistant for Platestory — a premium custom cake brand in Chennai, India.
-
-Platestory's pricing (per kg, excl. customisation & delivery):
-- Classic: Vanilla ₹1,107 | Butterscotch ₹1,307 | Chocolate Truffle ₹1,507 | Rainbow ₹1,957
-- Specialities: Red Velvet ₹1,707 | Belgian Choc Ganache ₹2,207 | Biscoff ₹2,357 | Berry ₹2,507
-- Exotics: Rasmalai ₹2,207 | Tender Coconut ₹1,957 | Mango ₹1,657
-- Customisation tiers: 1-tier +₹500 | 2-tier +₹1,500 | 3-tier +₹2,500
-- Little Bites: Cupcakes ₹127/pc | Macarons ₹107/pc | Cakesicles ₹157/pc | Cakepops ₹87/pc
-- Bento cakes: small format, typically ₹600-₹900 range
-
-Business verticals:
-- B2C Little Cakes: Bento, cupcakes, small birthday cakes. Fast cycle, low ticket (₹500-₹2,500). Converts quickly.
-- B2C Large Cakes: Wedding, engagement, anniversary, tiered cakes. High ticket (₹3,000-₹30,000+). Longer cycle.
-- Corporate: Bulk orders, repeat business. High value.
-
-Conversion signals (from strongest to weakest):
-1. Advance paid / says "confirmed" / "I'll pay now" = CONFIRMED
-2. Asking for account details / payment link = HOT
-3. Event within 7 days + reference image shared = HOT
-4. Price accepted, says "okay" or "fine" = HOT
-5. Asking for price/quote + specific date mentioned = WARM
-6. Sent reference image without asking price yet = WARM
-7. Just asking "what flavours do you have" / "do you deliver to X" = COLD
-8. No date, no reference, vague = COLD
-
-Negotiation context:
-- If customer pushes back on price (e.g. quoted ₹10,300, asks for ₹10,000) = still HOT, close to converting
-- If customer says "let me check / will confirm later" = WARM, needs follow-up within 2 hours
-- If customer goes silent after price = needs nudge, still WARM for 24 hours
-
-Now analyze this WhatsApp message:
-Contact: {contact_name}
-Message: {message}
-
-Return ONLY a JSON object, no explanation, no markdown:
-{{
-  "cake_type": "birthday|wedding|anniversary|engagement|baby_shower|corporate|bento|little_bites|custom|unknown",
-  "event_date": "YYYY-MM-DD or null",
-  "lead_score": "HOT|WARM|COLD",
-  "funnel_stage": "enquiry|ref_shared|quoted|confirmed",
-  "business_vertical": "little_cakes|large_cakes|corporate|unknown",
-  "estimated_order_value": "low(<2500)|mid(2500-8000)|high(8000-20000)|premium(20000+)|unknown",
-  "urgency_days": null or integer,
-  "conversion_probability": "high|medium|low",
-  "next_action": "one line — what salesperson should do next",
-  "notes": "one line summary of customer intent"
-}}"""
-
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = response.content[0].text.strip()
-        text = re.sub(r"```json|```", "", text).strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"Claude extraction error: {e}")
-        return {}
-
-class ExtractionRequest(BaseModel):
-    salesperson_email: str
+class CustomerExtraction(SQLModel, table=True):
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    device_id: str
+    salesperson_id: str
     contact_name: str
     message: str
+    event_date: Optional[datetime] = None
+    cake_type: Optional[str] = None
+    budget_inr: Optional[int] = None
+    lead_score: str
+    suggested_action: Optional[str] = None
+    key_info: Optional[str] = None
+    extracted_by: str
+    captured_at: datetime = SQLField(default_factory=datetime.utcnow)
 
-class LegacyBatch(BaseModel):
+class FollowUpTask(SQLModel, table=True):
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    contact_name: str
     salesperson_id: str
-    device_id: str
-    batch_size: int = 1
-    extractions: List[dict]
+    event_date: datetime
+    cake_type: Optional[str] = None
+    follow_up_at: datetime
+    urgency: str
+    completed: bool = False
+    kommo_deal_id: Optional[str] = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
 
-@app.post("/api/v1/extractions")
-async def extract(req: Request):
-    auth = req.headers.get("Authorization", "")
-    body = await req.json()
+class CustomerProfile(SQLModel, table=True):
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    contact_name: str = SQLField(index=True, unique=True)
+    total_interactions: int = 0
+    last_seen: Optional[datetime] = None
+    next_event_date: Optional[datetime] = None
+    cake_types_ordered: str = ""
+    total_budget_inr: int = 0
+    lead_score: str = "WARM"
+    assigned_salesperson: Optional[str] = None
+    kommo_contact_id: Optional[str] = None
+    created_at: datetime = SQLField(default_factory=datetime.utcnow)
 
-    # Android legacy format
-    if auth == f"Bearer {AGENT_SECRET}":
-        extractions = body.get("extractions", [])
-        salesperson = body.get("salesperson_id", "unknown")
-        conn = get_db()
-        for item in extractions:
-            msg = item.get("message", "")
-            contact = item.get("contact_name", "")
-            if not msg or not contact or contact in ["Add status","Calls","Chats"]: continue
-            if len(msg) < 5: continue
-            conn.execute("""INSERT INTO extractions 
-                (salesperson_email, contact_name, message, event_date, cake_type, lead_score, funnel_stage, captured_at)
-                VALUES (?,?,?,?,?,?,?,?)""",
-                (salesperson, contact, msg,
-                 parse_date_from_message(msg), parse_cake_type(msg),
-                 parse_lead_score(msg), parse_funnel_stage(msg),
-                 datetime.utcnow().isoformat()))
-        conn.commit()
-        conn.close()
-        return {"status": "ok"}
+engine = create_engine(DATABASE_URL)
 
-    # Chrome extension format (session token)
-    token = auth.replace("Bearer ", "")
-    conn = get_db()
-    session = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
-    if not session:
-        # Try X-Session-Token header
-        token = req.headers.get("X-Session-Token", "")
-        session = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
-    if not session:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Not authenticated")
+def get_session():
+    with Session(engine) as session:
+        yield session
 
-    contact = body.get("contact_name", "")
-    msg = body.get("message", "")
-    salesperson = body.get("salesperson_email", session["email"])
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    SQLModel.metadata.create_all(engine)
+    print("✅ Platestory Brain started. DB ready.")
+    yield
 
-    if not contact or not msg or len(msg) < 5: 
-        conn.close()
-        return {"status": "skipped"}
-    if contact in ["Add status","Calls","Chats","Status"]:
-        conn.close()
-        return {"status": "skipped"}
+app = FastAPI(title="Platestory Brain", version="1.0.0", lifespan=lifespan)
 
-    # Try Claude first, fall back to regex
-    ai = await claude_extract(msg, contact)
-    event_date           = ai.get("event_date")            or parse_date_from_message(msg)
-    cake_type            = ai.get("cake_type")             or parse_cake_type(msg)
-    lead_score           = ai.get("lead_score")            or parse_lead_score(msg)
-    funnel_stage         = ai.get("funnel_stage")          or parse_funnel_stage(msg)
-    notes                = ai.get("notes", "")
-    next_action          = ai.get("next_action", "")
-    conversion_prob      = ai.get("conversion_probability", "")
-    business_vertical    = ai.get("business_vertical", "")
-    estimated_order_value= ai.get("estimated_order_value", "")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    conn.execute("""INSERT INTO extractions
-        (salesperson_email, contact_name, message, event_date, cake_type, lead_score,
-         funnel_stage, notes, next_action, conversion_probability, business_vertical,
-         estimated_order_value, captured_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (salesperson, contact, msg,
-         event_date, cake_type, lead_score, funnel_stage,
-         notes, next_action, conversion_prob, business_vertical,
-         estimated_order_value, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return {"status": "ok", "ai_extraction": bool(ai), "score": lead_score, "next_action": next_action, "notes": notes}
-
-@app.get("/api/v1/extractions/recent")
-def recent_extractions(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials if credentials else ""
-    conn = get_db()
-    # Allow both agent secret and session token
+def verify_agent(authorization: str = Header(...)):
+    token = authorization.replace("Bearer ", "")
     if token != AGENT_SECRET:
-        session = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
-        if not session:
-            conn.close()
-            raise HTTPException(status_code=401)
-    rows = conn.execute("""
-        SELECT contact_name, message, event_date, cake_type, lead_score, funnel_stage,
-               salesperson_email, captured_at
-        FROM extractions ORDER BY captured_at DESC LIMIT 20
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        raise HTTPException(status_code=401, detail="Invalid agent token")
+    return token
 
-# ── DASHBOARD DATA ────────────────────────────────────────────────────────────
+class ExtractionItem(BaseModel):
+    contact_name: str
+    message: str
+    event_date: Optional[str] = None
+    cake_type: Optional[str] = None
+    budget_inr: Optional[int] = None
+    lead_score: str = "WARM"
+    suggested_action: Optional[str] = None
+    key_info: Optional[str] = None
+    extracted_by: str = "local"
+    captured_at: Optional[str] = None
 
-@app.get("/api/v1/dashboard")
-def dashboard(user=Depends(get_current_user)):
-    conn = get_db()
-    today = datetime.today().date()
-    next30 = today + timedelta(days=30)
-    is_admin = user["role"] == "admin"
-    email = user["email"]
+class BatchUpload(BaseModel):
+    device_id: str
+    salesperson_id: str
+    batch_size: int
+    extractions: List[ExtractionItem]
 
-    where = "" if is_admin else f"AND salesperson_email='{email}'"
-
-    upcoming = conn.execute(f"""
-        SELECT contact_name, event_date, cake_type, lead_score, message, salesperson_email, funnel_stage
-        FROM extractions WHERE event_date BETWEEN ? AND ? {where}
-        ORDER BY event_date ASC
-    """, (today.isoformat(), next30.isoformat())).fetchall()
-
-    hot = conn.execute(f"""
-        SELECT contact_name, message, cake_type, lead_score, captured_at, salesperson_email, funnel_stage
-        FROM extractions WHERE lead_score='HOT' {where}
-        ORDER BY captured_at DESC LIMIT 20
-    """).fetchall()
-
-    recent = conn.execute(f"""
-        SELECT id, contact_name, message, cake_type, lead_score, event_date,
-               captured_at, salesperson_email, funnel_stage, follow_up_done, assigned_to,
-               notes, next_action, conversion_probability, business_vertical, estimated_order_value
-        FROM extractions WHERE 1=1 {where}
-        ORDER BY captured_at DESC LIMIT 50
-    """).fetchall()
-
-    total = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE 1=1 {where}").fetchone()["c"]
-
-    # Unattended — no follow up in 4 hours
-    four_hours_ago = (datetime.utcnow() - timedelta(hours=4)).isoformat()
-    unattended = conn.execute(f"""
-        SELECT id, contact_name, message, salesperson_email, captured_at, cake_type
-        FROM extractions 
-        WHERE follow_up_done=0 AND captured_at < ? {where}
-        ORDER BY captured_at ASC LIMIT 20
-    """, (four_hours_ago,)).fetchall()
-
-    # Funnel breakdown
-    funnel = conn.execute(f"""
-        SELECT funnel_stage, COUNT(*) as count FROM extractions WHERE 1=1 {where}
-        GROUP BY funnel_stage
-    """).fetchall()
-
-    # Salesperson stats (admin only)
-    sp_stats = []
-    if is_admin:
-        sp_stats = conn.execute("""
-            SELECT salesperson_email, COUNT(*) as total,
-                   SUM(CASE WHEN lead_score='HOT' THEN 1 ELSE 0 END) as hot,
-                   SUM(CASE WHEN follow_up_done=1 THEN 1 ELSE 0 END) as followed_up
-            FROM extractions GROUP BY salesperson_email
-        """).fetchall()
-
-    # Users list (admin only)
-    users = []
-    if is_admin:
-        users = conn.execute("SELECT email, name, role FROM users").fetchall()
-
-    conn.close()
-    return {
-        "role": user["role"],
-        "email": email,
-        "total_customers": total,
-        "confirmed_orders": confirmed,
-        "slots_used": min(confirmed, 300),
-        "slots_total": 300,
-        "upcoming_events": [dict(r) for r in upcoming],
-        "hot_leads": [dict(r) for r in hot],
-        "recent_leads": [dict(r) for r in recent],
-        "unattended_leads": [dict(r) for r in unattended],
-        "funnel": [dict(r) for r in funnel],
-        "salesperson_stats": [dict(r) for r in sp_stats],
-        "users": [dict(r) for r in users]
-    }
-
-@app.post("/api/v1/leads/{lead_id}/followup")
-def mark_followup(lead_id: int, user=Depends(get_current_user)):
-    conn = get_db()
-    conn.execute("UPDATE extractions SET follow_up_done=1, follow_up_at=? WHERE id=?",
-        (datetime.utcnow().isoformat(), lead_id))
-    conn.execute("INSERT INTO follow_ups (extraction_id, done_by, done_at) VALUES (?,?,?)",
-        (lead_id, user["email"], datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-@app.post("/api/v1/leads/{lead_id}/assign")
-def assign_lead(lead_id: int, body: dict, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    conn = get_db()
-    conn.execute("UPDATE extractions SET assigned_to=? WHERE id=?", (body.get("email"), lead_id))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
-
-@app.delete("/api/v1/leads/{lead_id}")
-def delete_lead(lead_id: int, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    conn = get_db()
-    conn.execute("DELETE FROM extractions WHERE id=?", (lead_id,))
-    conn.commit()
-    conn.close()
-    return {"status": "deleted"}
+class AIExtractRequest(BaseModel):
+    prompt: str
+    contact_name: str
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+async def health():
+    return {"status": "alive", "service": "platestory-brain"}
+
+@app.post("/api/v1/extractions")
+async def receive_extractions(
+    batch: BatchUpload,
+    session: Session = Depends(get_session),
+    _auth = Depends(verify_agent)
+):
+    stored = 0
+    for item in batch.extractions:
+        extraction = CustomerExtraction(
+            device_id=batch.device_id,
+            salesperson_id=batch.salesperson_id,
+            contact_name=item.contact_name,
+            message=item.message,
+            event_date=datetime.fromisoformat(item.event_date) if item.event_date else None,
+            cake_type=item.cake_type,
+            budget_inr=item.budget_inr,
+            lead_score=item.lead_score,
+            suggested_action=item.suggested_action,
+            key_info=item.key_info,
+            extracted_by=item.extracted_by,
+        )
+        session.add(extraction)
+        await upsert_customer_profile(session, batch.salesperson_id, item)
+        if item.event_date:
+            event_dt = datetime.fromisoformat(item.event_date)
+            schedule_follow_up(session, item, batch.salesperson_id, event_dt)
+        stored += 1
+
+    session.commit()
+
+    hot_leads = [i for i in batch.extractions if i.lead_score == "HOT"]
+    if hot_leads:
+        asyncio.create_task(sync_to_kommo(hot_leads, batch.salesperson_id))
+
+    return {"stored": stored, "status": "ok"}
+
+
+async def upsert_customer_profile(session: Session, salesperson_id: str, item: ExtractionItem):
+    profile = session.exec(
+        select(CustomerProfile).where(CustomerProfile.contact_name == item.contact_name)
+    ).first()
+
+    if not profile:
+        profile = CustomerProfile(
+            contact_name=item.contact_name,
+            assigned_salesperson=salesperson_id,
+        )
+
+    profile.total_interactions += 1
+    profile.last_seen = datetime.utcnow()
+    profile.lead_score = item.lead_score
+
+    if item.event_date:
+        profile.next_event_date = datetime.fromisoformat(item.event_date)
+
+    if item.cake_type and item.cake_type not in profile.cake_types_ordered:
+        existing = profile.cake_types_ordered.split(",") if profile.cake_types_ordered else []
+        existing.append(item.cake_type)
+        profile.cake_types_ordered = ",".join(filter(None, existing))
+
+    if item.budget_inr:
+        profile.total_budget_inr = max(profile.total_budget_inr, item.budget_inr)
+
+    session.add(profile)
+
+
+def schedule_follow_up(session: Session, item: ExtractionItem, salesperson_id: str, event_date: datetime):
+    now = datetime.utcnow()
+    days_to_event = (event_date - now).days
+
+    if days_to_event < 0:
+        return
+
+    if days_to_event > 30:
+        follow_up_in_days = 7
+        urgency = "NORMAL"
+    elif days_to_event > 14:
+        follow_up_in_days = 3
+        urgency = "MEDIUM"
+    elif days_to_event > 7:
+        follow_up_in_days = 1
+        urgency = "HIGH"
+    else:
+        follow_up_in_days = 0
+        urgency = "CRITICAL"
+
+    follow_up_at = now + timedelta(days=follow_up_in_days)
+    follow_up_at = follow_up_at.replace(hour=10, minute=0, second=0)
+
+    existing = session.exec(
+        select(FollowUpTask).where(
+            FollowUpTask.contact_name == item.contact_name,
+            FollowUpTask.completed == False
+        )
+    ).first()
+
+    if existing:
+        if urgency in ["CRITICAL", "HIGH"] and existing.urgency in ["NORMAL", "MEDIUM"]:
+            existing.urgency = urgency
+            existing.follow_up_at = follow_up_at
+            session.add(existing)
+        return
+
+    task = FollowUpTask(
+        contact_name=item.contact_name,
+        salesperson_id=salesperson_id,
+        event_date=event_date,
+        cake_type=item.cake_type,
+        follow_up_at=follow_up_at,
+        urgency=urgency,
+    )
+    session.add(task)
+
+
+async def sync_to_kommo(hot_leads: List[ExtractionItem], salesperson_id: str):
+    if not KOMMO_API_URL or not KOMMO_ACCESS_TOKEN:
+        return
+
+    async with httpx.AsyncClient() as client:
+        for lead in hot_leads:
+            try:
+                search = await client.get(
+                    f"{KOMMO_API_URL}/api/v4/contacts",
+                    headers={"Authorization": f"Bearer {KOMMO_ACCESS_TOKEN}"},
+                    params={"query": lead.contact_name},
+                )
+                data = search.json()
+                contact_id = None
+                if data.get("_embedded", {}).get("contacts"):
+                    contact_id = data["_embedded"]["contacts"][0]["id"]
+
+                if contact_id:
+                    note_text = f"🤖 Agent Update:\n"
+                    if lead.event_date:
+                        note_text += f"📅 Event: {lead.event_date}\n"
+                    if lead.cake_type:
+                        note_text += f"🎂 Type: {lead.cake_type}\n"
+                    if lead.budget_inr:
+                        note_text += f"💰 Budget: ₹{lead.budget_inr:,}\n"
+                    if lead.key_info:
+                        note_text += f"📝 {lead.key_info}\n"
+                    note_text += f"🔥 Lead Score: {lead.lead_score}"
+
+                    await client.post(
+                        f"{KOMMO_API_URL}/api/v4/contacts/{contact_id}/notes",
+                        headers={
+                            "Authorization": f"Bearer {KOMMO_ACCESS_TOKEN}",
+                            "Content-Type": "application/json"
+                        },
+                        json=[{"note_type": "common", "params": {"text": note_text}}]
+                    )
+            except Exception as e:
+                print(f"Kommo sync error for {lead.contact_name}: {e}")
+
+
+@app.post("/ai/extract")
+async def ai_extract(
+    request: AIExtractRequest,
+    _auth = Depends(verify_agent)
+):
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="AI extraction not configured")
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": request.prompt}]
+    )
+    return {"result": message.content[0].text}
+
+
+@app.get("/api/v1/dashboard")
+async def dashboard(
+    session: Session = Depends(get_session),
+    _auth = Depends(verify_agent)
+):
+    now = datetime.utcnow()
+
+    # ALL incomplete follow-ups, ordered by urgency and date
+    urgent = session.exec(
+        select(FollowUpTask).where(
+            FollowUpTask.completed == False,
+            FollowUpTask.event_date >= now  # only future events
+        ).order_by(FollowUpTask.event_date)
+    ).all()
+
+    # HOT leads from last 48h (extended from 24h)
+    hot_leads = session.exec(
+        select(CustomerProfile).where(
+            CustomerProfile.lead_score == "HOT",
+            CustomerProfile.last_seen >= now - timedelta(hours=48)
+        )
+    ).all()
+
+    # ALL upcoming events in next 30 days (extended from 7)
+    upcoming_events = session.exec(
+        select(CustomerProfile).where(
+            CustomerProfile.next_event_date >= now,
+            CustomerProfile.next_event_date <= now + timedelta(days=30)
+        ).order_by(CustomerProfile.next_event_date)
+    ).all()
+
+    # ALL customers seen in last 7 days — full pipeline view
+    recent_leads = session.exec(
+        select(CustomerProfile).where(
+            CustomerProfile.last_seen >= now - timedelta(days=7)
+        ).order_by(CustomerProfile.last_seen)
+    ).all()
+
+    # Total customers in DB
+    all_profiles = session.exec(select(CustomerProfile)).all()
+
+    return {
+        "urgent_follow_ups": len([t for t in urgent if t.urgency in ["CRITICAL", "HIGH"]]),
+        "hot_leads_today": len(hot_leads),
+        "events_this_week": len(upcoming_events),
+        "total_customers": len(all_profiles),
+        "follow_ups": [
+            {
+                "contact": t.contact_name,
+                "event_date": t.event_date.isoformat(),
+                "urgency": t.urgency,
+                "days_to_event": (t.event_date - now).days,
+                "cake_type": t.cake_type,
+                "salesperson": t.salesperson_id,
+            } for t in urgent
+        ],
+        "hot_leads": [
+            {
+                "contact": l.contact_name,
+                "cake_type": l.cake_types_ordered,
+                "budget": l.total_budget_inr,
+                "salesperson": l.assigned_salesperson
+            } for l in hot_leads
+        ],
+        "upcoming_events": [
+            {
+                "contact": p.contact_name,
+                "event_date": p.next_event_date.isoformat(),
+                "days_away": (p.next_event_date - now).days,
+                "cake_type": p.cake_types_ordered,
+                "lead_score": p.lead_score,
+                "salesperson": p.assigned_salesperson,
+            } for p in upcoming_events
+        ],
+        "recent_leads": [
+            {
+                "contact": p.contact_name,
+                "lead_score": p.lead_score,
+                "cake_type": p.cake_types_ordered,
+                "event_date": p.next_event_date.isoformat() if p.next_event_date else None,
+                "last_seen": p.last_seen.isoformat() if p.last_seen else None,
+                "salesperson": p.assigned_salesperson,
+            } for p in reversed(recent_leads)
+        ],
+    }
+
+
+@app.get("/api/v1/patterns")
+async def patterns(session: Session = Depends(get_session), _auth = Depends(verify_agent)):
+    all_profiles = session.exec(select(CustomerProfile)).all()
+
+    cake_counts: dict = {}
+    for p in all_profiles:
+        for cake in p.cake_types_ordered.split(","):
+            if cake:
+                cake_counts[cake] = cake_counts.get(cake, 0) + 1
+
+    hot_rate = len([p for p in all_profiles if p.lead_score == "HOT"]) / max(len(all_profiles), 1)
+
+    return {
+        "total_customers": len(all_profiles),
+        "hot_lead_rate": round(hot_rate * 100, 1),
+        "cake_type_breakdown": sorted(cake_counts.items(), key=lambda x: -x[1]),
+        "avg_budget": sum(p.total_budget_inr for p in all_profiles) / max(len(all_profiles), 1),
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
