@@ -113,11 +113,17 @@ init_db()
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
 
-def detect_city(message: str, contact: str) -> str:
+def detect_city_from_message(message: str, contact: str) -> str:
     msg = (message + " " + contact).lower()
-    hyd_kw = ["hyderabad","hyd","jubilee hills","banjara hills","gachibowli","kondapur","hitech city","madhapur","secunderabad","ameerpet"]
+    hyd_kw = ["hyderabad","hyd","jubilee hills","banjara hills","gachibowli",
+              "kondapur","hitech city","madhapur","secunderabad","ameerpet",
+              "kukatpally","miyapur","begumpet","dilsukhnagar","lb nagar"]
+    chn_kw = ["chennai","madras","anna nagar","velachery","adyar","t nagar",
+              "tnagar","tambaram","porur","omr","ecr","nungambakkam",
+              "mylapore","guindy","chromepet","perambur","sholinganallur"]
     if any(k in msg for k in hyd_kw): return "hyderabad"
-    return "chennai"
+    if any(k in msg for k in chn_kw): return "chennai"
+    return "unknown"
 
 def parse_date_from_message(message: str) -> Optional[str]:
     msg = message.lower()
@@ -264,7 +270,9 @@ Return ONLY valid JSON:
   "conversion_probability": "high|medium|low",
   "next_action": "one line — what salesperson must do right now",
   "notes": "one line summary of intent and conversation context",
-  "suggested_reply": "natural WhatsApp reply to send (2-3 sentences max, conversational, not salesy)",
+  "city": "chennai|hyderabad|unknown",
+  "city_clarification": "if city is unknown, a natural question to ask customer which city they are in (null if city is known)",
+  "suggested_reply": "natural WhatsApp reply to send (2-3 sentences max, conversational, not salesy). If city unknown, include the city clarification question naturally in this reply.",
   "drop_detected": false
 }}"""
 
@@ -384,7 +392,9 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
         ).fetchone()
         existing_dict = dict(existing) if existing else None
 
-        city = detect_city(msg, contact)
+        # City: Claude detects first, fallback to keyword, then unknown
+        ai_city = ai.get("city", "unknown") if ai else "unknown"
+        city = ai_city if ai_city in ["chennai","hyderabad"] else detect_city_from_message(msg, contact)
 
         ai = await claude_extract(msg, contact, conv_ctx, has_image, existing_dict)
 
@@ -592,6 +602,18 @@ def update_stage(lead_id: int, body: dict, user=Depends(get_current_user)):
     conn = get_db()
     conn.execute("UPDATE extractions SET funnel_stage=?, last_updated=? WHERE id=?",
         (body.get("stage"), datetime.utcnow().isoformat(), lead_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.post("/api/v1/leads/{lead_id}/city")
+def update_city(lead_id: int, body: dict, user=Depends(get_current_user)):
+    city = body.get("city", "")
+    if city not in ["chennai", "hyderabad"]:
+        raise HTTPException(status_code=400, detail="Invalid city")
+    conn = get_db()
+    conn.execute("UPDATE extractions SET city=?, last_updated=? WHERE id=?",
+        (city, datetime.utcnow().isoformat(), lead_id))
     conn.commit()
     conn.close()
     return {"status": "ok"}
