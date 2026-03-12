@@ -17,8 +17,7 @@ security = HTTPBearer(auto_error=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 AGENT_SECRET   = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
-# UPDATED: Path for Railway Volume persistence
-DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db") 
+DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db")
 ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -28,7 +27,7 @@ SMTP_PASS      = os.getenv("SMTP_PASS", "")
 ALERT_EMAIL    = os.getenv("ALERT_EMAIL", "vamsi.bhogi@platestory.in")
 
 CITIES = {
-    "chennai": {"name": "Chennai", "slots": 300},
+    "chennai":   {"name": "Chennai",   "slots": 300},
     "hyderabad": {"name": "Hyderabad", "slots": 300}
 }
 
@@ -50,28 +49,173 @@ CAKE_KEYWORDS = {
     "custom":     ["custom cake","theme cake","designer cake","corporate","office","launch","farewell","retirement"]
 }
 
+# ── NOISE FILTER ───────────────────────────────────────────────────────────────
+# Contacts and message patterns that are NOT real customers
+
+NOISE_CONTACTS = {
+    "WA Business", "WhatsApp Business", "WhatsApp", "Chats", "Calls",
+    "Status", "Add status", "Camera", "WhatsApp Web", "Backup",
+    "Missed video call", "Missed voice call"
+}
+
+NOISE_MESSAGE_PATTERNS = [
+    r"^checking for new messages$",
+    r"^messages and calls are end-to-end encrypted",
+    r"^tap to learn more$",
+    r"^you're now connected",
+    r"^\+?\d{10,15}$",  # pure phone number
+    r"^(hi|hello|hey|ok|okay|yes|no|thanks|thank you|noted|sure)\.?$",  # single word greetings (too vague alone)
+]
+
+def is_noise(contact: str, message: str) -> bool:
+    if contact in NOISE_CONTACTS:
+        return True
+    # Contact name is just a phone number
+    if re.match(r"^\+?\d[\d\s\-]{8,}$", contact.strip()):
+        return False  # phone-number contacts ARE real customers, don't filter
+    msg_lower = message.lower().strip()
+    for pattern in NOISE_MESSAGE_PATTERNS:
+        if re.match(pattern, msg_lower, re.IGNORECASE):
+            return True
+    return False
+
+# ── PHONE NUMBER EXTRACTION ────────────────────────────────────────────────────
+
+def extract_phone_number(contact_name: str, message: str) -> Optional[str]:
+    """Extract phone number from contact name or message text."""
+    # Check if contact name IS a phone number
+    phone_in_name = re.search(r'\+?\d[\d\s\-]{9,14}', contact_name)
+    if phone_in_name:
+        digits = re.sub(r'[\s\-]', '', phone_in_name.group())
+        if len(digits) >= 10:
+            return digits
+
+    # Check message for phone number
+    phone_in_msg = re.search(r'(?:my number|call me|whatsapp me|contact|phone|mobile)[:\s]*(\+?\d[\d\s\-]{9,14})', message, re.IGNORECASE)
+    if phone_in_msg:
+        digits = re.sub(r'[\s\-]', '', phone_in_msg.group(1))
+        if len(digits) >= 10:
+            return digits
+
+    # Bare phone number in message
+    bare_phone = re.search(r'\b(\+91[\s\-]?\d{10}|\d{10})\b', message)
+    if bare_phone:
+        return re.sub(r'[\s\-]', '', bare_phone.group())
+
+    return None
+
+# ── REPEAT ORDER DETECTION ─────────────────────────────────────────────────────
+
+def is_new_order_context(existing_lead: dict, new_message: str, ai_result: dict) -> bool:
+    """
+    Returns True if this message represents a NEW order from an existing customer,
+    rather than a continuation of the current conversation.
+    """
+    if not existing_lead:
+        return False
+
+    existing_stage = existing_lead.get("funnel_stage", "enquiry")
+    existing_status = existing_lead.get("conversion_status", "open")
+
+    # If previous order was confirmed/converted, any new enquiry = new order
+    if existing_status in ("converted", "dropped") and existing_stage in ("confirmed",):
+        new_stage = ai_result.get("funnel_stage", "enquiry")
+        if new_stage in ("enquiry", "ref_shared"):
+            return True
+
+    # If previous event date has passed and customer is asking about a new date
+    prev_event = existing_lead.get("event_date")
+    if prev_event:
+        try:
+            prev_date = date.fromisoformat(prev_event)
+            if prev_date < date.today():
+                new_event = ai_result.get("event_date")
+                if new_event and new_event != prev_event:
+                    return True
+        except:
+            pass
+
+    return False
+
+def get_order_number(conn, contact_name: str) -> int:
+    """Count how many orders this customer has had."""
+    count = conn.execute(
+        "SELECT COUNT(*) as c FROM customers WHERE contact_name=?", (contact_name,)
+    ).fetchone()
+    return (count["c"] if count else 0) + 1
+
+# ── DATABASE ───────────────────────────────────────────────────────────────────
+
 def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
 
 def get_db():
-    # Ensure directory exists for the volume
     db_dir = os.path.dirname(DB_PATH)
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
-        
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
+
     conn.execute("""CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
         role TEXT DEFAULT 'salesperson', name TEXT,
         city TEXT DEFAULT 'chennai', created_at TEXT)""")
+
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY, email TEXT NOT NULL,
         role TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
+    # NEW: customers table — one row per customer per order
+    conn.execute("""CREATE TABLE IF NOT EXISTS customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact_name TEXT NOT NULL,
+        phone_number TEXT,
+        order_number INTEGER DEFAULT 1,
+        salesperson_email TEXT,
+
+        -- Conversation
+        messages TEXT DEFAULT '[]',
+        last_message TEXT,
+        message_count INTEGER DEFAULT 0,
+
+        -- AI-extracted intelligence (with confidence)
+        cake_type TEXT, cake_type_confidence TEXT DEFAULT 'uncertain',
+        event_date TEXT, event_date_confidence TEXT DEFAULT 'uncertain',
+        budget_range TEXT, budget_confidence TEXT DEFAULT 'uncertain',
+        city TEXT DEFAULT 'unknown', city_confidence TEXT DEFAULT 'uncertain',
+        weight_kg TEXT, weight_confidence TEXT DEFAULT 'uncertain',
+        flavour TEXT, flavour_confidence TEXT DEFAULT 'uncertain',
+        occasion_detail TEXT,
+
+        -- Lead intelligence
+        lead_score TEXT DEFAULT 'WARM',
+        funnel_stage TEXT DEFAULT 'enquiry',
+        conversion_probability TEXT DEFAULT 'low',
+        conversion_status TEXT DEFAULT 'open',
+        business_vertical TEXT,
+        estimated_order_value TEXT,
+        drop_detected INTEGER DEFAULT 0,
+
+        -- Co-pilot
+        next_action TEXT,
+        copilot_recommendation TEXT,
+        suggested_reply TEXT,
+        urgency_flag INTEGER DEFAULT 0,
+
+        -- Metadata
+        has_image INTEGER DEFAULT 0,
+        follow_up_done INTEGER DEFAULT 0,
+        follow_up_at TEXT,
+        assigned_to TEXT,
+        notes TEXT,
+        captured_at TEXT,
+        last_updated TEXT)""")
+
+    # Legacy extractions table — keep for backward compat
     conn.execute("""CREATE TABLE IF NOT EXISTS extractions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         salesperson_email TEXT, contact_name TEXT, message TEXT,
@@ -84,15 +228,60 @@ def init_db():
         city TEXT DEFAULT 'chennai', captured_at TEXT,
         conversion_status TEXT DEFAULT 'open',
         last_updated TEXT)""")
+
     conn.execute("""CREATE TABLE IF NOT EXISTS follow_ups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        extraction_id INTEGER, done_by TEXT, done_at TEXT, notes TEXT)""")
+        customer_id INTEGER, done_by TEXT, done_at TEXT, notes TEXT)""")
+
     conn.execute("""CREATE TABLE IF NOT EXISTS conversion_patterns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        pattern_type TEXT, pattern_data TEXT, outcome TEXT,
-        created_at TEXT)""")
+        pattern_type TEXT, pattern_data TEXT, outcome TEXT, created_at TEXT)""")
+
+    # B2B outbound tracker
+    conn.execute("""CREATE TABLE IF NOT EXISTS b2b_prospects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT NOT NULL,
+        contact_person TEXT,
+        phone TEXT,
+        email TEXT,
+        industry TEXT,
+        city TEXT DEFAULT 'chennai',
+        status TEXT DEFAULT 'not_contacted',
+        notes TEXT,
+        last_contact_at TEXT,
+        next_followup_at TEXT,
+        potential_value TEXT,
+        assigned_to TEXT,
+        created_by TEXT,
+        created_at TEXT,
+        updated_at TEXT)""")
+
     conn.commit()
-    # Add missing columns if upgrading from older schema
+
+    # Schema migrations for existing deployments
+    for col, defn in [
+        ("phone_number", "TEXT"),
+        ("order_number", "INTEGER DEFAULT 1"),
+        ("copilot_recommendation", "TEXT"),
+        ("urgency_flag", "INTEGER DEFAULT 0"),
+        ("cake_type_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("event_date_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("budget_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("city_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("weight_kg", "TEXT"),
+        ("weight_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("flavour", "TEXT"),
+        ("flavour_confidence", "TEXT DEFAULT 'uncertain'"),
+        ("occasion_detail", "TEXT"),
+        ("budget_range", "TEXT"),
+        ("messages", "TEXT DEFAULT '[]'"),
+        ("message_count", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE customers ADD COLUMN {col} {defn}")
+            conn.commit()
+        except: pass
+
     for col, defn in [
         ("has_image", "INTEGER DEFAULT 0"),
         ("city", "TEXT DEFAULT 'chennai'"),
@@ -104,10 +293,12 @@ def init_db():
             conn.execute(f"ALTER TABLE extractions ADD COLUMN {col} {defn}")
             conn.commit()
         except: pass
+
     try:
         conn.execute("ALTER TABLE users ADD COLUMN city TEXT DEFAULT 'chennai'")
         conn.commit()
     except: pass
+
     existing = conn.execute("SELECT * FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
     if not existing:
         conn.execute("INSERT INTO users (email,password_hash,role,name,city,created_at) VALUES (?,?,?,?,?,?)",
@@ -200,40 +391,52 @@ def send_email_alert(subject: str, body: str):
     except Exception as e:
         print(f"Email alert failed: {e}")
 
-# ── CLAUDE ─────────────────────────────────────────────────────────────────────
+def days_until(event_date_str: str) -> Optional[int]:
+    try:
+        d = date.fromisoformat(event_date_str)
+        return (d - date.today()).days
+    except:
+        return None
+
+# ── CLAUDE AI ──────────────────────────────────────────────────────────────────
 
 async def claude_extract(message: str, contact_name: str,
-                          conversation_context: str = "",
+                          conversation_history: list = None,
                           has_image: bool = False,
-                          existing_lead: dict = None) -> dict:
+                          existing_customer: dict = None) -> dict:
     if not CLAUDE_AVAILABLE or not ANTHROPIC_KEY:
         return {}
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
+        # Build conversation context block
         context_block = ""
-        if conversation_context:
-            try:
-                ctx = json.loads(conversation_context)
-                if ctx:
-                    context_block = "\n\nConversation history (oldest first):\n"
-                    for m in ctx[-10:]:
-                        context_block += f"- {m.get('text','')}\n"
-            except: pass
+        if conversation_history:
+            context_block = "\n\nFull conversation so far (oldest first):\n"
+            for m in conversation_history[-15:]:
+                context_block += f"- {m}\n"
 
+        # Build existing customer profile block
         existing_block = ""
-        if existing_lead:
+        if existing_customer:
+            days = days_until(existing_customer.get("event_date", "")) if existing_customer.get("event_date") else None
+            days_str = f"{days} days away" if days is not None else "unknown"
             existing_block = f"""
-Previous analysis of this lead:
-- Lead score: {existing_lead.get('lead_score', 'unknown')}
-- Funnel stage: {existing_lead.get('funnel_stage', 'unknown')}
-- Notes: {existing_lead.get('notes', '')}
-- Last message: {existing_lead.get('message', '')}
-Update your analysis based on the new message. If the stage has changed, reflect that."""
+Current customer profile:
+- Lead score: {existing_customer.get('lead_score', 'unknown')}
+- Stage: {existing_customer.get('funnel_stage', 'unknown')}
+- Cake type: {existing_customer.get('cake_type', 'unknown')} (confidence: {existing_customer.get('cake_type_confidence', 'uncertain')})
+- Event date: {existing_customer.get('event_date', 'unknown')} ({days_str})
+- Budget: {existing_customer.get('budget_range', 'unknown')} (confidence: {existing_customer.get('budget_confidence', 'uncertain')})
+- City: {existing_customer.get('city', 'unknown')} (confidence: {existing_customer.get('city_confidence', 'uncertain')})
+- Notes: {existing_customer.get('notes', '')}
+Update all fields based on new message. Promote confidence from uncertain→likely→confirmed as more evidence arrives."""
 
-        image_block = "\nNOTE: Customer has sent an image/photo — likely a reference image for the cake design. Treat as ref_shared stage signal." if has_image else ""
+        image_block = "\nNOTE: Customer sent an image/photo — likely a reference design. Treat as ref_shared signal." if has_image else ""
 
-        prompt = f"""You are the AI sales brain for Platestory — premium custom cakes in Chennai & Hyderabad.
+        prompt = f"""You are the AI intelligence brain of Platestory — a premium custom cake brand in Chennai and Hyderabad.
+
+Your job: extract structured intelligence from WhatsApp customer messages and give the sales executive a precise co-pilot recommendation.
 
 Platestory pricing (per kg):
 - Classic: Vanilla ₹1,107 | Butterscotch ₹1,307 | Chocolate Truffle ₹1,507 | Rainbow ₹1,957
@@ -241,50 +444,62 @@ Platestory pricing (per kg):
 - Exotics: Rasmalai ₹2,207 | Tender Coconut ₹1,957 | Mango ₹1,657
 - Customisation: 1-tier +₹500 | 2-tier +₹1,500 | 3-tier +₹2,500
 - Little Bites: Cupcakes ₹127/pc | Macarons ₹107/pc | Cakesicles ₹157/pc | Cakepops ₹87/pc
-- Bento: ₹600-₹900
+- Bento: ₹600–₹900
+
+Confidence levels:
+- "confirmed": customer explicitly stated this (e.g. "2kg chocolate cake for 25th March")
+- "likely": strongly implied (e.g. "birthday next week" → likely birthday cake)
+- "uncertain": inferred or unclear — needs clarification
 
 Conversion signals (strongest → weakest):
 1. Advance paid / "confirmed" / sharing payment → confirmed, HOT
-2. Asking for payment link / UPI / account number → HOT
-3. Event within 7 days + ref image sent → HOT
-4. Price accepted ("okay","fine","sounds good","proceed") → HOT
-5. Asking price + specific date mentioned → WARM, quoted
+2. Asking for payment link / UPI → HOT
+3. Event within 7 days + ref image → HOT
+4. Price accepted ("okay","fine","proceed") → HOT
+5. Asking price + specific date → WARM, quoted
 6. Sent ref image / design preference → WARM, ref_shared
-7. Asking about flavours / delivery area / general → COLD, enquiry
-8. Gone silent after price → COLD, needs nudge
+7. General enquiry → WARM, enquiry
+8. Gone silent after price → COLD
 
-Drop signals (likely won't convert):
-- "too expensive", "out of budget", "will manage", "nevermind", "cancel", "not required"
-
-Conversion probability rules:
-- high: HOT score OR confirmed stage
-- medium: WARM with specific date OR ref image sent
-- low: COLD or vague enquiry or drop signal detected{existing_block}{context_block}{image_block}
+Drop signals: "too expensive", "out of budget", "will manage", "nevermind", "cancel", "not required"
+{existing_block}{context_block}{image_block}
 
 Contact: {contact_name}
 Latest message: {message}
 
-Return ONLY valid JSON:
+Return ONLY valid JSON (no markdown):
 {{
   "cake_type": "birthday|wedding|anniversary|engagement|baby_shower|corporate|bento|little_bites|custom|unknown",
+  "cake_type_confidence": "confirmed|likely|uncertain",
   "event_date": "YYYY-MM-DD or null",
+  "event_date_confidence": "confirmed|likely|uncertain",
+  "budget_range": "e.g. ₹2,000–₹3,000 or null",
+  "budget_confidence": "confirmed|likely|uncertain",
+  "weight_kg": "e.g. 2kg or null",
+  "weight_confidence": "confirmed|likely|uncertain",
+  "flavour": "e.g. chocolate truffle or null",
+  "flavour_confidence": "confirmed|likely|uncertain",
+  "city": "chennai|hyderabad|unknown",
+  "city_confidence": "confirmed|likely|uncertain",
+  "city_clarification": "natural question to ask if city unknown, else null",
+  "occasion_detail": "brief occasion detail e.g. daughter's 5th birthday or null",
   "lead_score": "HOT|WARM|COLD",
   "funnel_stage": "enquiry|ref_shared|quoted|confirmed",
   "conversion_status": "open|converted|dropped",
+  "conversion_probability": "high|medium|low",
   "business_vertical": "little_cakes|large_cakes|corporate|unknown",
   "estimated_order_value": "low(<2500)|mid(2500-8000)|high(8000-20000)|premium(20000+)|unknown",
-  "conversion_probability": "high|medium|low",
-  "next_action": "one line — what salesperson must do right now",
-  "notes": "one line summary of intent and conversation context",
-  "city": "chennai|hyderabad|unknown",
-  "city_clarification": "if city is unknown, a natural question to ask customer which city they are in (null if city is known)",
-  "suggested_reply": "natural WhatsApp reply to send (2-3 sentences max, conversational, not salesy). If city unknown, include the city clarification question naturally in this reply.",
-  "drop_detected": false
+  "urgency_flag": false,
+  "drop_detected": false,
+  "next_action": "one precise action the exec must take RIGHT NOW",
+  "copilot_recommendation": "2-3 sentence co-pilot briefing: what this customer wants, what stage they are at, what to say and why. Be specific — mention names, dates, amounts where known.",
+  "notes": "one line summary",
+  "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, not salesy). If city unknown, include city clarification naturally."
 }}"""
 
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=600,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.content[0].text.strip()
@@ -323,8 +538,6 @@ def login(req: LoginRequest):
     return {"token": token, "role": user["role"], "name": user["name"],
             "city": dict(user).get("city", "chennai")}
 
-# ... [Registration and User endpoints remain the same] ...
-
 @app.post("/api/v1/auth/register")
 def register(req: RegisterRequest, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
@@ -360,7 +573,7 @@ def delete_user(user_id: int, user=Depends(get_current_user)):
 def me(user=Depends(get_current_user)):
     return user
 
-# ── EXTRACTIONS ────────────────────────────────────────────────────────────────
+# ── EXTRACTIONS (SMART UPSERT) ─────────────────────────────────────────────────
 
 @app.post("/api/v1/extractions")
 async def extract(req: Request, background_tasks: BackgroundTasks):
@@ -385,74 +598,181 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
     alerts = []
 
     for item in items:
-        msg   = item.get("message", "").strip()
-        contact = item.get("contact_name", "").strip()
-        conv_ctx = item.get("conversation_context", "")
+        msg      = item.get("message", "").strip()
+        contact  = item.get("contact_name", "").strip()
+        conv_ctx = item.get("conversation_context", [])
         has_image = bool(item.get("has_image", False))
 
-        if not msg or not contact or len(msg) < 3: continue
-        if contact in ["Add status","Calls","Chats","Status","WhatsApp","Camera"]: continue
+        if not msg or not contact or len(msg) < 2: continue
+        if is_noise(contact, msg): continue
 
+        # Extract phone number
+        phone = extract_phone_number(contact, msg)
+
+        # Get existing customer profile (most recent open order)
         existing = conn.execute(
-            "SELECT * FROM extractions WHERE contact_name=? ORDER BY captured_at DESC LIMIT 1",
+            """SELECT * FROM customers WHERE contact_name=?
+               ORDER BY captured_at DESC LIMIT 1""",
             (contact,)
         ).fetchone()
         existing_dict = dict(existing) if existing else None
 
-        # --- THE BUG FIX: CALL AI BEFORE ACCESSING IT ---
-        ai = await claude_extract(msg, contact, conv_ctx, has_image, existing_dict)
+        # Build conversation history
+        if existing_dict and existing_dict.get("messages"):
+            try:
+                history = json.loads(existing_dict["messages"])
+            except:
+                history = []
+        else:
+            history = []
+
+        if isinstance(conv_ctx, list):
+            history.extend(conv_ctx)
+        history.append(msg)
+        history = history[-20:]  # keep last 20 messages
+
+        # Run AI extraction
+        ai = await claude_extract(msg, contact, history, has_image, existing_dict)
         if not isinstance(ai, dict) or not ai:
             ai = {}
 
+        # Resolve fields with confidence
         ai_city = ai.get("city", "unknown")
-        # Logic: Claude detects city from message first, fallback to keyword matching
         city = ai_city if ai_city in ["chennai","hyderabad"] else detect_city_from_message(msg, contact)
-        # -----------------------------------------------
+        city_conf = ai.get("city_confidence", "uncertain") if city != "unknown" else "uncertain"
 
-        event_date        = ai.get("event_date")             or parse_date_from_message(msg)
-        cake_type         = ai.get("cake_type")              or parse_cake_type(msg)
-        lead_score        = ai.get("lead_score")             or parse_lead_score(msg)
-        funnel_stage      = ai.get("funnel_stage")           or parse_funnel_stage(msg)
-        notes             = ai.get("notes", "")
-        next_action       = ai.get("next_action", "")
-        conv_prob         = ai.get("conversion_probability", "")
-        biz_vertical      = ai.get("business_vertical", "")
-        order_value       = ai.get("estimated_order_value", "")
-        suggested_reply   = ai.get("suggested_reply", "")
-        conv_status       = ai.get("conversion_status", "open")
-        drop_detected     = ai.get("drop_detected", False)
+        event_date = ai.get("event_date") or parse_date_from_message(msg)
+        event_date_conf = ai.get("event_date_confidence", "uncertain") if event_date else "uncertain"
+
+        cake_type = ai.get("cake_type") or parse_cake_type(msg)
+        cake_type_conf = ai.get("cake_type_confidence", "uncertain") if cake_type else "uncertain"
+
+        lead_score     = ai.get("lead_score")     or parse_lead_score(msg)
+        funnel_stage   = ai.get("funnel_stage")   or parse_funnel_stage(msg)
+        conv_prob      = ai.get("conversion_probability", "low")
+        conv_status    = ai.get("conversion_status", "open")
+        biz_vertical   = ai.get("business_vertical", "")
+        order_value    = ai.get("estimated_order_value", "")
+        notes          = ai.get("notes", "")
+        next_action    = ai.get("next_action", "")
+        copilot        = ai.get("copilot_recommendation", "")
+        suggested_reply = ai.get("suggested_reply", "")
+        drop_detected  = bool(ai.get("drop_detected", False))
+        urgency_flag   = bool(ai.get("urgency_flag", False))
+        budget_range   = ai.get("budget_range", "")
+        budget_conf    = ai.get("budget_confidence", "uncertain")
+        weight_kg      = ai.get("weight_kg", "")
+        weight_conf    = ai.get("weight_confidence", "uncertain")
+        flavour        = ai.get("flavour", "")
+        flavour_conf   = ai.get("flavour_confidence", "uncertain")
+        occasion_detail = ai.get("occasion_detail", "")
 
         if has_image and funnel_stage == "enquiry":
             funnel_stage = "ref_shared"
 
+        # Event within 3 days = urgent
+        if event_date:
+            d = days_until(event_date)
+            if d is not None and 0 <= d <= 3:
+                urgency_flag = True
+                lead_score = "HOT"
+
         now_iso = datetime.utcnow().isoformat()
+        messages_json = json.dumps(history)
 
-        conn.execute("""INSERT INTO extractions
-            (salesperson_email, contact_name, message, event_date, cake_type, lead_score,
-             funnel_stage, notes, next_action, conversion_probability, business_vertical,
-             estimated_order_value, suggested_reply, has_image, city,
-             conversion_status, captured_at, last_updated)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (salesperson, contact, msg, event_date, cake_type, lead_score,
-             funnel_stage, notes, next_action, conv_prob, biz_vertical,
-             order_value, suggested_reply, 1 if has_image else 0, city,
-             conv_status, now_iso, now_iso))
+        # Detect if this is a new order from a returning customer
+        new_order = is_new_order_context(existing_dict, msg, ai)
 
-        if existing_dict and existing_dict.get("lead_score") != lead_score:
-            conn.execute("""INSERT INTO conversion_patterns (pattern_type, pattern_data, outcome, created_at)
-                VALUES (?,?,?,?)""", (
-                "score_change",
-                json.dumps({"from": existing_dict.get("lead_score"), "to": lead_score, "message": msg[:100]}),
-                conv_status, now_iso))
+        if existing_dict and not new_order:
+            # UPDATE existing customer profile
+            conn.execute("""UPDATE customers SET
+                last_message=?, messages=?, message_count=message_count+1,
+                cake_type=COALESCE(NULLIF(?,cake_type), cake_type, ?),
+                cake_type_confidence=?,
+                event_date=COALESCE(NULLIF(?,event_date), event_date, ?),
+                event_date_confidence=?,
+                budget_range=COALESCE(NULLIF(?,budget_range), budget_range, ?),
+                budget_confidence=?,
+                weight_kg=COALESCE(NULLIF(?,weight_kg), weight_kg, ?),
+                weight_confidence=?,
+                flavour=COALESCE(NULLIF(?,flavour), flavour, ?),
+                flavour_confidence=?,
+                city=CASE WHEN ?='unknown' THEN city ELSE ? END,
+                city_confidence=?,
+                occasion_detail=COALESCE(NULLIF(?,occasion_detail), occasion_detail, ?),
+                lead_score=?, funnel_stage=?, conversion_probability=?,
+                conversion_status=CASE WHEN ?='open' THEN conversion_status ELSE ? END,
+                business_vertical=COALESCE(NULLIF(?,business_vertical), business_vertical, ?),
+                estimated_order_value=COALESCE(NULLIF(?,estimated_order_value), estimated_order_value, ?),
+                notes=?, next_action=?, copilot_recommendation=?,
+                suggested_reply=?, drop_detected=?, urgency_flag=?,
+                has_image=CASE WHEN ?=1 THEN 1 ELSE has_image END,
+                phone_number=COALESCE(NULLIF(?,phone_number), phone_number, ?),
+                salesperson_email=?, last_updated=?
+                WHERE id=?""",
+                (msg, messages_json,
+                 cake_type, cake_type, cake_type_conf,
+                 event_date, event_date, event_date_conf,
+                 budget_range, budget_range, budget_conf,
+                 weight_kg, weight_kg, weight_conf,
+                 flavour, flavour, flavour_conf,
+                 city, city, city_conf,
+                 occasion_detail, occasion_detail,
+                 lead_score, funnel_stage, conv_prob,
+                 conv_status, conv_status,
+                 biz_vertical, biz_vertical,
+                 order_value, order_value,
+                 notes, next_action, copilot,
+                 suggested_reply, 1 if drop_detected else 0, 1 if urgency_flag else 0,
+                 1 if has_image else 0,
+                 phone, phone,
+                 salesperson, now_iso,
+                 existing_dict["id"]))
+            customer_id = existing_dict["id"]
+        else:
+            # INSERT new customer profile (new customer or new order)
+            order_num = get_order_number(conn, contact)
+            conn.execute("""INSERT INTO customers
+                (contact_name, phone_number, order_number, salesperson_email,
+                 messages, last_message, message_count,
+                 cake_type, cake_type_confidence,
+                 event_date, event_date_confidence,
+                 budget_range, budget_confidence,
+                 weight_kg, weight_confidence,
+                 flavour, flavour_confidence,
+                 city, city_confidence, occasion_detail,
+                 lead_score, funnel_stage, conversion_probability, conversion_status,
+                 business_vertical, estimated_order_value,
+                 next_action, copilot_recommendation, suggested_reply, notes,
+                 drop_detected, urgency_flag, has_image,
+                 captured_at, last_updated)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (contact, phone, order_num, salesperson,
+                 messages_json, msg, 1,
+                 cake_type, cake_type_conf,
+                 event_date, event_date_conf,
+                 budget_range, budget_conf,
+                 weight_kg, weight_conf,
+                 flavour, flavour_conf,
+                 city, city_conf, occasion_detail,
+                 lead_score, funnel_stage, conv_prob, conv_status,
+                 biz_vertical, order_value,
+                 next_action, copilot, suggested_reply, notes,
+                 1 if drop_detected else 0, 1 if urgency_flag else 0, 1 if has_image else 0,
+                 now_iso, now_iso))
+            customer_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
 
         results.append({"contact": contact, "score": lead_score, "city": city})
 
+        # Alerts
         if lead_score == "HOT" and (not existing_dict or existing_dict.get("lead_score") != "HOT"):
             alerts.append(f"HOT LEAD: {contact} ({city})\nMessage: {msg[:150]}\nNext: {next_action}")
         if drop_detected:
             alerts.append(f"DROPPED LEAD: {contact} ({city})\nMessage: {msg[:150]}")
         if funnel_stage == "confirmed":
             alerts.append(f"CONFIRMED ORDER: {contact} ({city})\nMessage: {msg[:150]}")
+        if urgency_flag:
+            alerts.append(f"URGENT — EVENT SOON: {contact} ({city})\nEvent: {event_date}\nNext: {next_action}")
 
     conn.commit()
     conn.close()
@@ -463,24 +783,7 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
 
     return {"status": "ok", "processed": len(results), "results": results}
 
-# ... [Remaining dashboard and action endpoints stay the same] ...
-
-@app.get("/api/v1/extractions/recent")
-def recent_extractions(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials if credentials else ""
-    conn = get_db()
-    if token != AGENT_SECRET:
-        session = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
-        if not session:
-            conn.close()
-            raise HTTPException(status_code=401)
-    rows = conn.execute("""
-        SELECT contact_name, message, event_date, cake_type, lead_score,
-               funnel_stage, salesperson_email, captured_at, suggested_reply, city, has_image
-        FROM extractions ORDER BY captured_at DESC LIMIT 20
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+# ── DASHBOARD API ──────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/dashboard")
 def dashboard(user=Depends(get_current_user), city: str = None):
@@ -500,59 +803,78 @@ def dashboard(user=Depends(get_current_user), city: str = None):
 
     where = ("" if is_admin else f"AND salesperson_email='{email}'") + " " + city_filter
 
-    total     = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE 1=1 {where}").fetchone()["c"]
-    confirmed = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE funnel_stage='confirmed' {where}").fetchone()["c"]
-    dropped   = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE conversion_status='dropped' {where}").fetchone()["c"]
-    hot_count = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE lead_score='HOT' {where}").fetchone()["c"]
-    warm_count= conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE lead_score='WARM' {where}").fetchone()["c"]
-    image_leads= conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE has_image=1 {where}").fetchone()["c"]
+    total     = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE 1=1 {where}").fetchone()["c"]
+    confirmed = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE funnel_stage='confirmed' {where}").fetchone()["c"]
+    dropped   = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE conversion_status='dropped' {where}").fetchone()["c"]
+    hot_count = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE lead_score='HOT' {where}").fetchone()["c"]
+    warm_count= conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE lead_score='WARM' {where}").fetchone()["c"]
+    urgent_count = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE urgency_flag=1 AND conversion_status='open' {where}").fetchone()["c"]
+    unknown_city = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE city='unknown' {where}").fetchone()["c"]
 
     forecast_low  = int((hot_count * 5500) + (warm_count * 5500 * 0.3))
     forecast_high = int((hot_count * 8000) + (warm_count * 8000 * 0.5))
 
     city_slots = {}
     for city_key, city_info in CITIES.items():
-        used = conn.execute(f"SELECT COUNT(*) as c FROM extractions WHERE funnel_stage='confirmed' AND city='{city_key}'").fetchone()["c"]
+        used = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE funnel_stage='confirmed' AND city='{city_key}'").fetchone()["c"]
         city_slots[city_key] = {"name": city_info["name"], "total": city_info["slots"], "used": used, "remaining": city_info["slots"] - used}
 
     upcoming = conn.execute(f"""
-        SELECT contact_name, event_date, cake_type, lead_score, message,
-               salesperson_email, funnel_stage, suggested_reply, city, has_image
-        FROM extractions WHERE event_date BETWEEN ? AND ? {where}
+        SELECT id, contact_name, phone_number, event_date, cake_type, lead_score,
+               last_message, salesperson_email, funnel_stage, city, occasion_detail,
+               budget_range, copilot_recommendation, order_number
+        FROM customers WHERE event_date BETWEEN ? AND ? {where}
         ORDER BY event_date ASC
     """, (today.isoformat(), next30.isoformat())).fetchall()
 
+    urgent = conn.execute(f"""
+        SELECT id, contact_name, phone_number, last_message, cake_type, lead_score,
+               captured_at, salesperson_email, funnel_stage, next_action, city,
+               event_date, copilot_recommendation, budget_range, order_number,
+               occasion_detail, urgency_flag
+        FROM customers WHERE urgency_flag=1 AND conversion_status='open' {where}
+        ORDER BY event_date ASC LIMIT 20
+    """).fetchall()
+
     hot = conn.execute(f"""
-        SELECT contact_name, message, cake_type, lead_score, captured_at,
-               salesperson_email, funnel_stage, next_action, suggested_reply, city, has_image, id
-        FROM extractions WHERE lead_score='HOT' {where}
+        SELECT id, contact_name, phone_number, last_message, cake_type, lead_score,
+               captured_at, salesperson_email, funnel_stage, next_action, city,
+               event_date, copilot_recommendation, suggested_reply, budget_range,
+               order_number, occasion_detail, messages, message_count,
+               cake_type_confidence, event_date_confidence, budget_confidence, city_confidence
+        FROM customers WHERE lead_score='HOT' AND conversion_status='open' {where}
         ORDER BY captured_at DESC LIMIT 30
     """).fetchall()
 
     recent = conn.execute(f"""
-        SELECT id, contact_name, message, cake_type, lead_score, event_date,
-               captured_at, salesperson_email, funnel_stage, follow_up_done, assigned_to,
-               notes, next_action, conversion_probability, business_vertical,
-               estimated_order_value, suggested_reply, has_image, city, conversion_status
-        FROM extractions WHERE 1=1 {where}
-        ORDER BY captured_at DESC LIMIT 100
+        SELECT id, contact_name, phone_number, last_message, cake_type, lead_score,
+               event_date, captured_at, salesperson_email, funnel_stage, follow_up_done,
+               assigned_to, notes, next_action, conversion_probability, business_vertical,
+               estimated_order_value, suggested_reply, has_image, city, conversion_status,
+               copilot_recommendation, budget_range, weight_kg, flavour, occasion_detail,
+               order_number, message_count, urgency_flag, drop_detected,
+               cake_type_confidence, event_date_confidence, budget_confidence, city_confidence,
+               messages, last_updated
+        FROM customers WHERE 1=1 {where}
+        ORDER BY last_updated DESC LIMIT 100
     """).fetchall()
 
     four_hours_ago = (datetime.utcnow() - timedelta(hours=4)).isoformat()
     unattended = conn.execute(f"""
-        SELECT id, contact_name, message, salesperson_email, captured_at,
-               cake_type, lead_score, next_action, suggested_reply, city, has_image
-        FROM extractions
+        SELECT id, contact_name, phone_number, last_message, salesperson_email,
+               captured_at, cake_type, lead_score, next_action, city, event_date,
+               copilot_recommendation
+        FROM customers
         WHERE follow_up_done=0 AND captured_at < ? AND conversion_status='open' {where}
         ORDER BY captured_at ASC LIMIT 20
     """, (four_hours_ago,)).fetchall()
 
     funnel = conn.execute(f"""
-        SELECT funnel_stage, COUNT(*) as count FROM extractions WHERE 1=1 {where} GROUP BY funnel_stage
+        SELECT funnel_stage, COUNT(*) as count FROM customers WHERE 1=1 {where} GROUP BY funnel_stage
     """).fetchall()
 
     score_breakdown = conn.execute(f"""
-        SELECT lead_score, COUNT(*) as count FROM extractions WHERE 1=1 {where} GROUP BY lead_score
+        SELECT lead_score, COUNT(*) as count FROM customers WHERE 1=1 {where} GROUP BY lead_score
     """).fetchall()
 
     sp_stats = []
@@ -565,7 +887,7 @@ def dashboard(user=Depends(get_current_user), city: str = None):
                    SUM(CASE WHEN funnel_stage='confirmed' THEN 1 ELSE 0 END) as confirmed,
                    SUM(CASE WHEN conversion_status='dropped' THEN 1 ELSE 0 END) as dropped,
                    city
-            FROM extractions GROUP BY salesperson_email
+            FROM customers GROUP BY salesperson_email
         """).fetchall()
 
     users = []
@@ -576,11 +898,13 @@ def dashboard(user=Depends(get_current_user), city: str = None):
     return {
         "role": user["role"], "email": email,
         "total_customers": total, "confirmed_orders": confirmed,
-        "dropped_leads": dropped, "image_leads": image_leads,
-        "hot_count": hot_count, "warm_count": warm_count,
+        "dropped_leads": dropped, "hot_count": hot_count,
+        "warm_count": warm_count, "urgent_count": urgent_count,
+        "unknown_city": unknown_city,
         "forecast_low": forecast_low, "forecast_high": forecast_high,
         "city_slots": city_slots,
         "upcoming_events":   [dict(r) for r in upcoming],
+        "urgent_leads":      [dict(r) for r in urgent],
         "hot_leads":         [dict(r) for r in hot],
         "recent_leads":      [dict(r) for r in recent],
         "unattended_leads":  [dict(r) for r in unattended],
@@ -590,12 +914,22 @@ def dashboard(user=Depends(get_current_user), city: str = None):
         "users":             [dict(r) for r in users]
     }
 
+# ── CUSTOMER ACTIONS ───────────────────────────────────────────────────────────
+
+@app.get("/api/v1/customers/{customer_id}")
+def get_customer(customer_id: int, user=Depends(get_current_user)):
+    conn = get_db()
+    c = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+    conn.close()
+    if not c: raise HTTPException(status_code=404)
+    return dict(c)
+
 @app.post("/api/v1/leads/{lead_id}/followup")
 def mark_followup(lead_id: int, user=Depends(get_current_user)):
     conn = get_db()
-    conn.execute("UPDATE extractions SET follow_up_done=1, follow_up_at=? WHERE id=?",
+    conn.execute("UPDATE customers SET follow_up_done=1, follow_up_at=? WHERE id=?",
         (datetime.utcnow().isoformat(), lead_id))
-    conn.execute("INSERT INTO follow_ups (extraction_id,done_by,done_at) VALUES (?,?,?)",
+    conn.execute("INSERT INTO follow_ups (customer_id,done_by,done_at) VALUES (?,?,?)",
         (lead_id, user["email"], datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
@@ -604,7 +938,7 @@ def mark_followup(lead_id: int, user=Depends(get_current_user)):
 @app.post("/api/v1/leads/{lead_id}/stage")
 def update_stage(lead_id: int, body: dict, user=Depends(get_current_user)):
     conn = get_db()
-    conn.execute("UPDATE extractions SET funnel_stage=?, last_updated=? WHERE id=?",
+    conn.execute("UPDATE customers SET funnel_stage=?, last_updated=? WHERE id=?",
         (body.get("stage"), datetime.utcnow().isoformat(), lead_id))
     conn.commit()
     conn.close()
@@ -616,7 +950,7 @@ def update_city(lead_id: int, body: dict, user=Depends(get_current_user)):
     if city not in ["chennai", "hyderabad"]:
         raise HTTPException(status_code=400, detail="Invalid city")
     conn = get_db()
-    conn.execute("UPDATE extractions SET city=?, last_updated=? WHERE id=?",
+    conn.execute("UPDATE customers SET city=?, city_confidence='confirmed', last_updated=? WHERE id=?",
         (city, datetime.utcnow().isoformat(), lead_id))
     conn.commit()
     conn.close()
@@ -625,7 +959,7 @@ def update_city(lead_id: int, body: dict, user=Depends(get_current_user)):
 @app.post("/api/v1/leads/{lead_id}/convert")
 def mark_converted(lead_id: int, user=Depends(get_current_user)):
     conn = get_db()
-    conn.execute("UPDATE extractions SET conversion_status='converted', funnel_stage='confirmed', last_updated=? WHERE id=?",
+    conn.execute("UPDATE customers SET conversion_status='converted', funnel_stage='confirmed', last_updated=? WHERE id=?",
         (datetime.utcnow().isoformat(), lead_id))
     conn.commit()
     conn.close()
@@ -634,7 +968,7 @@ def mark_converted(lead_id: int, user=Depends(get_current_user)):
 @app.post("/api/v1/leads/{lead_id}/drop")
 def mark_dropped(lead_id: int, user=Depends(get_current_user)):
     conn = get_db()
-    conn.execute("UPDATE extractions SET conversion_status='dropped', last_updated=? WHERE id=?",
+    conn.execute("UPDATE customers SET conversion_status='dropped', last_updated=? WHERE id=?",
         (datetime.utcnow().isoformat(), lead_id))
     conn.commit()
     conn.close()
@@ -644,7 +978,7 @@ def mark_dropped(lead_id: int, user=Depends(get_current_user)):
 def assign_lead(lead_id: int, body: dict, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
     conn = get_db()
-    conn.execute("UPDATE extractions SET assigned_to=? WHERE id=?", (body.get("email"), lead_id))
+    conn.execute("UPDATE customers SET assigned_to=? WHERE id=?", (body.get("email"), lead_id))
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -653,30 +987,95 @@ def assign_lead(lead_id: int, body: dict, user=Depends(get_current_user)):
 def delete_lead(lead_id: int, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
     conn = get_db()
-    conn.execute("DELETE FROM extractions WHERE id=?", (lead_id,))
+    conn.execute("DELETE FROM customers WHERE id=?", (lead_id,))
     conn.commit()
     conn.close()
     return {"status": "deleted"}
 
+# ── B2B OUTBOUND TRACKER ───────────────────────────────────────────────────────
+
+class B2BProspect(BaseModel):
+    company_name: str
+    contact_person: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    industry: Optional[str] = None
+    city: str = "chennai"
+    potential_value: Optional[str] = None
+    notes: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+@app.get("/api/v1/b2b")
+def list_b2b(user=Depends(get_current_user)):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM b2b_prospects ORDER BY updated_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.post("/api/v1/b2b")
+def create_b2b(prospect: B2BProspect, user=Depends(get_current_user)):
+    conn = get_db()
+    now = datetime.utcnow().isoformat()
+    conn.execute("""INSERT INTO b2b_prospects
+        (company_name, contact_person, phone, email, industry, city,
+         potential_value, notes, assigned_to, status, created_by, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (prospect.company_name, prospect.contact_person, prospect.phone,
+         prospect.email, prospect.industry, prospect.city,
+         prospect.potential_value, prospect.notes,
+         prospect.assigned_to or user["email"],
+         "not_contacted", user["email"], now, now))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.put("/api/v1/b2b/{prospect_id}")
+def update_b2b(prospect_id: int, body: dict, user=Depends(get_current_user)):
+    conn = get_db()
+    now = datetime.utcnow().isoformat()
+    allowed = ["status","notes","next_followup_at","contact_person","phone","email",
+               "potential_value","assigned_to","last_contact_at"]
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        conn.close()
+        return {"status": "no changes"}
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [now, prospect_id]
+    conn.execute(f"UPDATE b2b_prospects SET {set_clause}, updated_at=? WHERE id=?", values)
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.delete("/api/v1/b2b/{prospect_id}")
+def delete_b2b(prospect_id: int, user=Depends(get_current_user)):
+    if user["role"] != "admin": raise HTTPException(status_code=403)
+    conn = get_db()
+    conn.execute("DELETE FROM b2b_prospects WHERE id=?", (prospect_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+# ── INTELLIGENCE ───────────────────────────────────────────────────────────────
+
 @app.get("/api/v1/intelligence")
 def intelligence(user=Depends(get_current_user)):
     conn = get_db()
-    total = conn.execute("SELECT COUNT(*) as c FROM extractions").fetchone()["c"]
-    converted = conn.execute("SELECT COUNT(*) as c FROM extractions WHERE conversion_status='converted'").fetchone()["c"]
-    dropped = conn.execute("SELECT COUNT(*) as c FROM extractions WHERE conversion_status='dropped'").fetchone()["c"]
+    total = conn.execute("SELECT COUNT(*) as c FROM customers").fetchone()["c"]
+    converted = conn.execute("SELECT COUNT(*) as c FROM customers WHERE conversion_status='converted'").fetchone()["c"]
+    dropped = conn.execute("SELECT COUNT(*) as c FROM customers WHERE conversion_status='dropped'").fetchone()["c"]
     conv_rate = round((converted / total * 100), 1) if total > 0 else 0
 
     top_cakes = conn.execute("""
         SELECT cake_type, COUNT(*) as total,
                SUM(CASE WHEN conversion_status='converted' THEN 1 ELSE 0 END) as converted
-        FROM extractions WHERE cake_type IS NOT NULL
+        FROM customers WHERE cake_type IS NOT NULL
         GROUP BY cake_type ORDER BY converted DESC LIMIT 5
     """).fetchall()
 
     two_hours_ago = (datetime.utcnow() - timedelta(hours=2)).isoformat()
     at_risk = conn.execute("""
-        SELECT contact_name, city, captured_at, next_action, suggested_reply
-        FROM extractions
+        SELECT contact_name, phone_number, city, captured_at, next_action, copilot_recommendation, event_date
+        FROM customers
         WHERE lead_score='HOT' AND follow_up_done=0 AND captured_at < ?
         AND conversion_status='open'
         ORDER BY captured_at ASC LIMIT 10
@@ -686,7 +1085,7 @@ def intelligence(user=Depends(get_current_user)):
         SELECT city, COUNT(*) as total,
                SUM(CASE WHEN conversion_status='converted' THEN 1 ELSE 0 END) as converted,
                SUM(CASE WHEN lead_score='HOT' THEN 1 ELSE 0 END) as hot
-        FROM extractions GROUP BY city
+        FROM customers GROUP BY city
     """).fetchall()
 
     conn.close()
@@ -700,10 +1099,27 @@ def intelligence(user=Depends(get_current_user)):
         "city_performance": [dict(r) for r in city_perf]
     }
 
+@app.get("/api/v1/extractions/recent")
+def recent_extractions(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials if credentials else ""
+    conn = get_db()
+    if token != AGENT_SECRET:
+        session = conn.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
+        if not session:
+            conn.close()
+            raise HTTPException(status_code=401)
+    rows = conn.execute("""
+        SELECT id, contact_name, phone_number, last_message, lead_score,
+               funnel_stage, salesperson_email, last_updated, suggested_reply, city, has_image
+        FROM customers ORDER BY last_updated DESC LIMIT 20
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 @app.get("/health")
 def health():
     conn = get_db()
-    leads = conn.execute("SELECT COUNT(*) as c FROM extractions").fetchone()["c"]
+    leads = conn.execute("SELECT COUNT(*) as c FROM customers").fetchone()["c"]
     conn.close()
     return {"status": "ok", "time": datetime.utcnow().isoformat(), "leads": leads}
 
