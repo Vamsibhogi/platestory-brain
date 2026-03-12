@@ -450,55 +450,62 @@ Update all fields based on new message. Promote confidence from uncertain→like
 
         image_block = "\nNOTE: Customer sent an image/photo — likely a reference design. Treat as ref_shared signal." if has_image else ""
 
-        prompt = f"""You are the AI intelligence brain of Platestory — a premium custom cake brand in Chennai and Hyderabad.
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        prompt = f"""You are the AI intelligence core of Platestory — a premium custom cake brand operating in Chennai and Hyderabad. You think like a Palantir analyst: you stitch together every fragment of conversation, infer unstated intent, resolve ambiguity using context, and build a continuously-evolving customer intelligence profile. You never leave a field blank if evidence exists anywhere in the conversation.
 
-Your job: extract structured intelligence from WhatsApp customer messages and give the sales executive a precise co-pilot recommendation.
+Today's date: {today_str}
 
-Platestory pricing (per kg):
-- Classic: Vanilla ₹1,107 | Butterscotch ₹1,307 | Chocolate Truffle ₹1,507 | Rainbow ₹1,957
-- Specialities: Red Velvet ₹1,707 | Belgian Choc Ganache ₹2,207 | Biscoff ₹2,357 | Berry ₹2,507
-- Exotics: Rasmalai ₹2,207 | Tender Coconut ₹1,957 | Mango ₹1,657
-- Customisation: 1-tier +₹500 | 2-tier +₹1,500 | 3-tier +₹2,500
-- Little Bites: Cupcakes ₹127/pc | Macarons ₹107/pc | Cakesicles ₹157/pc | Cakepops ₹87/pc
-- Bento: ₹600–₹900
+━━━ PLATESTORY PRICING ━━━
+Cakes (per kg):
+• Vanilla ₹1,107 | Butterscotch ₹1,307 | Chocolate Truffle ₹1,507 | Rainbow ₹1,957
+• Red Velvet ₹1,707 | Belgian Choc Ganache ₹2,207 | Biscoff ₹2,357 | Berry ₹2,507
+• Rasmalai ₹2,207 | Tender Coconut ₹1,957 | Mango ₹1,657
+Tiers: 1-tier +₹500 | 2-tier +₹1,500 | 3-tier +₹2,500
+Little Bites: Cupcakes ₹127/pc | Macarons ₹107/pc | Cakesicles ₹157/pc | Cakepops ₹87/pc
+Bento: ₹600–₹900
 
-Confidence levels:
-- "confirmed": customer explicitly stated this (e.g. "2kg chocolate cake for 25th March")
-- "likely": strongly implied (e.g. "birthday next week" → likely birthday cake)
-- "uncertain": inferred or unclear — needs clarification
+━━━ INTELLIGENCE RULES ━━━
+1. NEVER return null/unknown if ANY message in the conversation contains the answer — scan the full history.
+2. Infer from context: "for my daughter" → birthday cake; "office party" → corporate; "15 kg" → large_cakes; "freeze at 3kg" → weight_kg=3kg confirmed.
+3. Budget inference: if customer says "1500 only" → budget_range=₹1,500, budget_confidence=confirmed. If they say "around 2500" → ₹2,000–₹3,000, likely.
+4. Date inference: "28th March" → 2026-03-28. "next week" → approximate. "April 5th" → 2026-04-05. Always use current year {today_str[:4]} unless stated otherwise.
+5. Weight inference: "3kg", "freeze at 3 kg", "for 15 kg" → extract the number. "small cake" → likely 0.5–1kg.
+6. City inference: area names like "Anna Nagar", "Velachery", "T Nagar", "Adyar", "OMR" → Chennai. "Banjara Hills", "Jubilee Hills", "Gachibowli", "Hitech City", "Kondapur" → Hyderabad.
+7. Flavour inference: "chocolate", "choco truffle", "red velvet", "biscoff", "vanilla", "mango" → extract directly.
+8. Occasion inference: "daughter's birthday", "wife's anniversary", "office farewell", "baby shower" → set occasion_detail precisely.
+9. Progressive confidence: if a field was previously "uncertain" and new message confirms it → upgrade to "confirmed".
+10. Urgency: event within 5 days → urgency_flag=true, lead_score=HOT regardless of other signals.
+11. Order value calculation: use weight × flavour price + tier cost. If weight unknown, estimate from occasion (birthday 1-2kg, wedding 5kg+, corporate 3kg+).
 
-Conversion signals (strongest → weakest):
-1. Advance paid / "confirmed" / sharing payment → confirmed, HOT
-2. Asking for payment link / UPI → HOT
-3. Event within 7 days + ref image → HOT
-4. Price accepted ("okay","fine","proceed") → HOT
-5. Asking price + specific date → WARM, quoted
-6. Sent ref image / design preference → WARM, ref_shared
-7. General enquiry → WARM, enquiry
-8. Gone silent after price → COLD
-
-Drop signals: "too expensive", "out of budget", "will manage", "nevermind", "cancel", "not required"
+━━━ CONVERSION SIGNALS ━━━
+HOT: payment sent | advance paid | "confirmed" | asking UPI/payment link | event ≤5 days
+WARM: price asked + date given | ref image sent | specific requirements stated | "how much for X"
+COLD: gone silent | "will think" | "too expensive" | "out of budget" | no response after quote
+DROPPED: "cancel" | "not required" | "nevermind" | "will manage elsewhere"
 {existing_block}{context_block}{image_block}
 
 Contact: {contact_name}
 Latest message: {message}
 
-Return ONLY valid JSON (no markdown):
+━━━ TASK ━━━
+Analyze ALL messages above (not just the latest). Build the most complete profile possible. Every field you leave null is a missed sales opportunity.
+
+Return ONLY valid JSON (no markdown, no explanation):
 {{
   "cake_type": "birthday|wedding|anniversary|engagement|baby_shower|corporate|bento|little_bites|custom|unknown",
   "cake_type_confidence": "confirmed|likely|uncertain",
   "event_date": "YYYY-MM-DD or null",
   "event_date_confidence": "confirmed|likely|uncertain",
-  "budget_range": "e.g. ₹2,000–₹3,000 or null",
+  "budget_range": "e.g. ₹1,500 or ₹2,000–₹3,000 or null",
   "budget_confidence": "confirmed|likely|uncertain",
-  "weight_kg": "e.g. 2kg or null",
+  "weight_kg": "e.g. 2kg or 3kg or null",
   "weight_confidence": "confirmed|likely|uncertain",
   "flavour": "e.g. chocolate truffle or null",
   "flavour_confidence": "confirmed|likely|uncertain",
   "city": "chennai|hyderabad|unknown",
   "city_confidence": "confirmed|likely|uncertain",
   "city_clarification": "natural question to ask if city unknown, else null",
-  "occasion_detail": "brief occasion detail e.g. daughter's 5th birthday or null",
+  "occasion_detail": "e.g. daughter's 5th birthday | wife's anniversary | office farewell or null",
   "lead_score": "HOT|WARM|COLD",
   "funnel_stage": "enquiry|ref_shared|quoted|confirmed",
   "conversion_status": "open|converted|dropped",
@@ -507,15 +514,15 @@ Return ONLY valid JSON (no markdown):
   "estimated_order_value": "low(<2500)|mid(2500-8000)|high(8000-20000)|premium(20000+)|unknown",
   "urgency_flag": false,
   "drop_detected": false,
-  "next_action": "one precise action the exec must take RIGHT NOW",
-  "copilot_recommendation": "2-3 sentence co-pilot briefing: what this customer wants, what stage they are at, what to say and why. Be specific — mention names, dates, amounts where known.",
-  "notes": "one line summary",
-  "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, not salesy). If city unknown, include city clarification naturally."
+  "next_action": "one precise action the exec must take RIGHT NOW — specific, actionable, time-aware",
+  "copilot_recommendation": "3-4 sentence briefing: who this customer is, what they want, where they are in the funnel, what to say next and why. Be specific — use names, dates, amounts, flavours where known.",
+  "notes": "one line complete summary of this customer",
+  "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, personal, not salesy). Reference what they asked. If city unknown, ask naturally."
 }}"""
 
         response = client.chat.completions.create(
             model="gpt-4.1-mini",
-            max_tokens=800,
+            max_tokens=1200,
             messages=[{"role": "user", "content": prompt}]
         )
         text = response.choices[0].message.content.strip()
