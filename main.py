@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -15,6 +16,15 @@ from datetime import datetime, date, timedelta
 app = FastAPI(title="Platestory AIR 6")
 security = HTTPBearer(auto_error=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_dashboard():
+    """Serve the Platestory dashboard at the root URL."""
+    dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    if os.path.exists(dashboard_path):
+        with open(dashboard_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>Dashboard file not found</h1><p>dashboard.html is missing from the deployment.</p>", status_code=404)
 
 AGENT_SECRET   = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
 DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db")
