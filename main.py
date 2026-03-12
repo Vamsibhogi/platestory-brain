@@ -6,10 +6,10 @@ from typing import List, Optional
 import sqlite3, os, re, secrets, hashlib, json, smtplib
 from email.mime.text import MIMEText
 try:
-    import anthropic
-    CLAUDE_AVAILABLE = True
+    from openai import OpenAI as _OpenAI
+    OPENAI_AVAILABLE = True
 except ImportError:
-    CLAUDE_AVAILABLE = False
+    OPENAI_AVAILABLE = False
 from datetime import datetime, date, timedelta
 
 app = FastAPI(title="Platestory AIR 6")
@@ -19,7 +19,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 AGENT_SECRET   = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
 DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db")
 ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_KEY     = os.getenv("OPENAI_API_KEY", "")
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER      = os.getenv("SMTP_USER", "")
@@ -420,10 +420,10 @@ async def claude_extract(message: str, contact_name: str,
                           conversation_history: list = None,
                           has_image: bool = False,
                           existing_customer: dict = None) -> dict:
-    if not CLAUDE_AVAILABLE or not ANTHROPIC_KEY:
+    if not OPENAI_AVAILABLE or not OPENAI_KEY:
         return {}
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        client = _OpenAI(api_key=OPENAI_KEY)
 
         # Build conversation context block
         context_block = ""
@@ -513,12 +513,12 @@ Return ONLY valid JSON (no markdown):
   "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, not salesy). If city unknown, include city clarification naturally."
 }}"""
 
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
-        text = response.content[0].text.strip()
+        text = response.choices[0].message.content.strip()
         text = re.sub(r"```json|```", "", text).strip()
         return json.loads(text)
     except Exception as e:
