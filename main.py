@@ -299,6 +299,22 @@ def init_db():
         conn.commit()
     except: pass
 
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN assigned_cities TEXT DEFAULT '[]'")
+        conn.commit()
+    except: pass
+
+    # Back-fill assigned_cities from city column for existing users
+    try:
+        users_to_fix = conn.execute("SELECT email, city, assigned_cities FROM users").fetchall()
+        for u in users_to_fix:
+            existing = json.loads(u['assigned_cities'] or '[]')
+            if not existing and u['city']:
+                conn.execute("UPDATE users SET assigned_cities=? WHERE email=?",
+                    (json.dumps([u['city']]), u['email']))
+        conn.commit()
+    except: pass
+
     existing = conn.execute("SELECT * FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
     if not existing:
         conn.execute("INSERT INTO users (email,password_hash,role,name,city,created_at) VALUES (?,?,?,?,?,?)",
@@ -520,6 +536,12 @@ class RegisterRequest(BaseModel):
     password: str
     name: str
     city: str = "chennai"
+    assigned_cities: List[str] = []
+
+class UpdateUserRequest(BaseModel):
+    assigned_cities: Optional[List[str]] = None
+    name: Optional[str] = None
+    city: Optional[str] = None
 
 @app.post("/api/v1/auth/login")
 def login(req: LoginRequest):
@@ -535,8 +557,13 @@ def login(req: LoginRequest):
         (token, req.email, user["role"], datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
+    user_dict = dict(user)
+    assigned = json.loads(user_dict.get("assigned_cities") or "[]")
+    if not assigned:
+        assigned = [user_dict.get("city", "chennai")]
     return {"token": token, "role": user["role"], "name": user["name"],
-            "city": dict(user).get("city", "chennai")}
+            "city": user_dict.get("city", "chennai"),
+            "assigned_cities": assigned}
 
 @app.post("/api/v1/auth/register")
 def register(req: RegisterRequest, user=Depends(get_current_user)):
@@ -544,9 +571,10 @@ def register(req: RegisterRequest, user=Depends(get_current_user)):
     if not req.email.endswith("@platestory.in"):
         raise HTTPException(status_code=400, detail="Only @platestory.in emails")
     conn = get_db()
+    assigned = req.assigned_cities if req.assigned_cities else [req.city]
     try:
-        conn.execute("INSERT INTO users (email,password_hash,role,name,city,created_at) VALUES (?,?,?,?,?,?)",
-            (req.email, hash_password(req.password), "salesperson", req.name, req.city, datetime.utcnow().isoformat()))
+        conn.execute("INSERT INTO users (email,password_hash,role,name,city,assigned_cities,created_at) VALUES (?,?,?,?,?,?,?)",
+            (req.email, hash_password(req.password), "salesperson", req.name, req.city, json.dumps(assigned), datetime.utcnow().isoformat()))
         conn.commit()
     except: raise HTTPException(status_code=400, detail="Email already exists")
     finally: conn.close()
@@ -556,9 +584,28 @@ def register(req: RegisterRequest, user=Depends(get_current_user)):
 def list_users(user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
     conn = get_db()
-    users = conn.execute("SELECT id, email, name, role, city, created_at FROM users").fetchall()
+    users = conn.execute("SELECT id, email, name, role, city, assigned_cities, created_at FROM users").fetchall()
     conn.close()
-    return [dict(u) for u in users]
+    result = []
+    for u in users:
+        ud = dict(u)
+        ud['assigned_cities'] = json.loads(ud.get('assigned_cities') or '[]') or [ud.get('city','chennai')]
+        result.append(ud)
+    return result
+
+@app.put("/api/v1/auth/users/{user_id}")
+def update_user(user_id: int, req: UpdateUserRequest, user=Depends(get_current_user)):
+    if user["role"] != "admin": raise HTTPException(status_code=403)
+    conn = get_db()
+    if req.assigned_cities is not None:
+        primary_city = req.assigned_cities[0] if req.assigned_cities else "chennai"
+        conn.execute("UPDATE users SET assigned_cities=?, city=? WHERE id=?",
+            (json.dumps(req.assigned_cities), primary_city, user_id))
+    if req.name is not None:
+        conn.execute("UPDATE users SET name=? WHERE id=?", (req.name, user_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
 
 @app.delete("/api/v1/auth/users/{user_id}")
 def delete_user(user_id: int, user=Depends(get_current_user)):
@@ -793,15 +840,27 @@ def dashboard(user=Depends(get_current_user), city: str = None):
     is_admin = user["role"] == "admin"
     email = user["email"]
 
+    # Resolve assigned cities for this user
+    user_row = conn.execute("SELECT city, assigned_cities, role FROM users WHERE email=?", (email,)).fetchone()
+    user_assigned_cities = []
+    if user_row:
+        raw = json.loads(user_row['assigned_cities'] or '[]')
+        user_assigned_cities = raw if raw else [user_row['city'] or 'chennai']
+
     city_filter = ""
     if city and city in CITIES:
-        city_filter = f"AND city='{city}'"
-    elif not is_admin:
-        user_city = conn.execute("SELECT city FROM users WHERE email=?", (email,)).fetchone()
-        if user_city:
-            city_filter = f"AND city='{user_city[0]}'"
+        # Explicit city filter from dropdown — respect it for admin; for salesperson only if assigned
+        if is_admin or city in user_assigned_cities:
+            city_filter = f"AND city='{city}'"
+    elif not is_admin and user_assigned_cities:
+        # Non-admin: restrict to their assigned cities
+        if len(user_assigned_cities) == 1:
+            city_filter = f"AND city='{user_assigned_cities[0]}'"
+        else:
+            cities_in = ','.join(f"'{c}'" for c in user_assigned_cities)
+            city_filter = f"AND city IN ({cities_in})"
 
-    where = ("" if is_admin else f"AND salesperson_email='{email}'") + " " + city_filter
+    where = "" + " " + city_filter
 
     total     = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE 1=1 {where}").fetchone()["c"]
     confirmed = conn.execute(f"SELECT COUNT(*) as c FROM customers WHERE funnel_stage='confirmed' {where}").fetchone()["c"]
