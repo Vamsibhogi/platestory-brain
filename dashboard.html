@@ -899,7 +899,7 @@
       </div>
       <div class="table-card">
         <table class="b2b-table">
-          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>City</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>City</th><th>Actions</th></tr></thead>
           <tbody id="users-tbody"></tbody>
         </table>
       </div>
@@ -1500,8 +1500,8 @@ function renderUsers(users) {
       <td>${esc(u.email)}</td>
       <td><span style="color:${u.role==='admin'?'var(--orange)':'var(--text-secondary)'};font-weight:500">${u.role}</span></td>
       <td>${cityEdit}</td>
-      <td style="display:flex;gap:6px;flex-wrap:wrap;">
-        ${!isAdmin ? `<button class="act-btn" onclick="resetUserPassword(${u.id},'${esc(u.name||u.email)}')">Reset Password</button>` : ''}
+      <td style="white-space:nowrap;">
+        ${!isAdmin ? `<button class="act-btn" style="margin-right:6px" onclick="resetUserPassword(${u.id},'${esc(u.name||u.email)}')" >Reset Password</button>` : ''}
         ${!isAdmin ? `<button class="act-btn red" onclick="deleteUser(${u.id})">Remove</button>` : ''}
       </td>
     </tr>`;
