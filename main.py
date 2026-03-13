@@ -1457,3 +1457,22 @@ async def _reprocess_all_background():
 async def reprocess_status():
     """Check the status of the background reprocessing job."""
     return _reprocess_status
+
+@app.get("/debug/claude-test")
+async def debug_claude_test():
+    """Debug endpoint to test Claude directly and capture exact error"""
+    import traceback
+    if not ANTHROPIC_AVAILABLE:
+        return {"success": False, "error": "anthropic package not installed"}
+    if not ANTHROPIC_KEY:
+        return {"success": False, "error": "ANTHROPIC_API_KEY not set", "key_prefix": ""}
+    try:
+        ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        response = ant_client.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=50,
+            messages=[{"role": "user", "content": "Reply with just: {\"test\": \"ok\"}"}]
+        )
+        return {"success": True, "response": response.content[0].text, "key_prefix": ANTHROPIC_KEY[:15] + "..."}
+    except Exception as e:
+        return {"success": False, "error": str(e), "key_prefix": ANTHROPIC_KEY[:15] + "...", "traceback": traceback.format_exc()[-500:]}
