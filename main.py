@@ -37,6 +37,7 @@ ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
 OPENAI_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # optional proxy base URL
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_KEY     = os.getenv("GEMINI_API_KEY", "")
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER      = os.getenv("SMTP_USER", "")
@@ -536,25 +537,64 @@ Return ONLY valid JSON (no markdown, no explanation):
   "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, personal, not salesy). Reference what they asked. If city unknown, ask naturally."
 }}"""
 
+        text = None
+        last_error = None
+
+        # Layer 1: Anthropic Claude 3.5 Haiku (primary — best structured extraction)
         if ANTHROPIC_AVAILABLE and ANTHROPIC_KEY:
-            ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            ant_response = ant_client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = ant_response.content[0].text.strip()
-        else:
-            client_kwargs = {"api_key": OPENAI_KEY}
-            if OPENAI_BASE_URL:
-                client_kwargs["base_url"] = OPENAI_BASE_URL
-            oai_client = _OpenAI(**client_kwargs)
-            oai_response = oai_client.chat.completions.create(
-                model="gpt-4.1-mini",
-                max_tokens=1200,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = oai_response.choices[0].message.content.strip()
+            try:
+                ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+                ant_response = ant_client.messages.create(
+                    model="claude-3-5-haiku-20241022",
+                    max_tokens=1200,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                text = ant_response.content[0].text.strip()
+                print("AI: Claude 3.5 Haiku succeeded")
+            except Exception as e:
+                last_error = e
+                print(f"AI Layer 1 (Claude) failed: {e}")
+
+        # Layer 2: OpenAI GPT-4.1 Mini (first fallback)
+        if text is None and OPENAI_AVAILABLE and OPENAI_KEY:
+            try:
+                client_kwargs = {"api_key": OPENAI_KEY}
+                if OPENAI_BASE_URL:
+                    client_kwargs["base_url"] = OPENAI_BASE_URL
+                oai_client = _OpenAI(**client_kwargs)
+                oai_response = oai_client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    max_tokens=1200,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                text = oai_response.choices[0].message.content.strip()
+                print("AI: GPT-4.1 Mini fallback succeeded")
+            except Exception as e:
+                last_error = e
+                print(f"AI Layer 2 (GPT-4.1 Mini) failed: {e}")
+
+        # Layer 3: Gemini Flash (second fallback via OpenAI-compatible API)
+        if text is None and GEMINI_KEY:
+            try:
+                gem_client = _OpenAI(
+                    api_key=GEMINI_KEY,
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                )
+                gem_response = gem_client.chat.completions.create(
+                    model="gemini-2.0-flash",
+                    max_tokens=1200,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                text = gem_response.choices[0].message.content.strip()
+                print("AI: Gemini Flash fallback succeeded")
+            except Exception as e:
+                last_error = e
+                print(f"AI Layer 3 (Gemini Flash) failed: {e}")
+
+        if text is None:
+            print(f"All AI layers failed. Last error: {last_error}")
+            return {}
+
         text = re.sub(r"```json|```", "", text).strip()
         return json.loads(text)
     except Exception as e:
