@@ -1236,3 +1236,22 @@ async def debug_ai_test():
         existing_customer=None
     )
     return {"ai_result": result, "openai_key_set": bool(OPENAI_KEY), "base_url": OPENAI_BASE_URL or "default", "available": OPENAI_AVAILABLE}
+
+@app.get("/debug/ai-error")
+async def debug_ai_error():
+    """Debug endpoint to capture the actual AI error"""
+    import traceback
+    try:
+        from openai import OpenAI as _OpenAI
+        client_kwargs = {"api_key": OPENAI_KEY}
+        if OPENAI_BASE_URL:
+            client_kwargs["base_url"] = OPENAI_BASE_URL
+        client = _OpenAI(**client_kwargs)
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Reply with JSON: {\"test\": \"ok\"}"}]
+        )
+        return {"success": True, "response": response.choices[0].message.content}
+    except Exception as e:
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
