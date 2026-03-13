@@ -1224,3 +1224,15 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.get("/debug/ai-test")
+async def debug_ai_test():
+    """Debug endpoint to test AI extraction directly on Railway"""
+    result = await claude_extract(
+        message="I need a 2kg chocolate truffle birthday cake for 28th March, budget 2500, Chennai Anna Nagar",
+        contact_name="Debug Test",
+        conversation_history=[],
+        has_image=False,
+        existing_customer=None
+    )
+    return {"ai_result": result, "openai_key_set": bool(OPENAI_KEY), "base_url": OPENAI_BASE_URL or "default", "available": OPENAI_AVAILABLE}
