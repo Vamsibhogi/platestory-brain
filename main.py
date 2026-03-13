@@ -30,6 +30,7 @@ AGENT_SECRET   = os.getenv("AGENT_SECRET", "platestory-2025-xK9mP2qR7nL4")
 DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db")
 ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
 OPENAI_KEY     = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # optional proxy base URL
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER      = os.getenv("SMTP_USER", "")
@@ -433,7 +434,10 @@ async def claude_extract(message: str, contact_name: str,
     if not OPENAI_AVAILABLE or not OPENAI_KEY:
         return {}
     try:
-        client = _OpenAI(api_key=OPENAI_KEY)
+        client_kwargs = {"api_key": OPENAI_KEY}
+        if OPENAI_BASE_URL:
+            client_kwargs["base_url"] = OPENAI_BASE_URL
+        client = _OpenAI(**client_kwargs)
 
         # Build conversation context block
         context_block = ""
