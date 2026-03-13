@@ -1344,7 +1344,7 @@ function renderStats(d) {
       <div class="stat-icon">✅</div>
       <div class="stat-label">Confirmed Orders</div>
       <div class="stat-value" style="color:var(--green)">${d.confirmed_orders||0}</div>
-      <div class="stat-sub">${d.dropped_leads||0} dropped</div>
+      <div class="stat-sub">${d.dropped_leads||0} dropped · ${(d.confirmed_orders||0) + (d.dropped_leads||0)} total closed</div>
     </div>
     <div class="stat-card">
       <div class="stat-icon">💰</div>

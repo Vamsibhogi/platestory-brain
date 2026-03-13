@@ -600,7 +600,7 @@ Return ONLY valid JSON (no markdown, no explanation):
                     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
                 )
                 gem_response = gem_client.chat.completions.create(
-                    model="gemini-2.0-flash",
+                    model="gemini-1.5-flash",
                     max_tokens=1200,
                     messages=[{"role": "user", "content": prompt}]
                 )
@@ -1399,7 +1399,7 @@ async def system_health():
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
             )
             gem.chat.completions.create(
-                model="gemini-2.0-flash",
+                model="gemini-1.5-flash",
                 max_tokens=5,
                 messages=[{"role": "user", "content": "ping"}]
             )
