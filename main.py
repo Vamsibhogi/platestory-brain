@@ -1274,7 +1274,17 @@ def health():
     conn = get_db()
     leads = conn.execute("SELECT COUNT(*) as c FROM customers").fetchone()["c"]
     conn.close()
-    return {"status": "ok", "time": datetime.utcnow().isoformat(), "leads": leads}
+    return {
+        "status": "ok",
+        "version": "3-layer-ai-v1",
+        "time": datetime.utcnow().isoformat(),
+        "leads": leads,
+        "ai_layers": {
+            "layer1_claude": bool(ANTHROPIC_KEY and ANTHROPIC_AVAILABLE),
+            "layer2_openai": bool(OPENAI_KEY),
+            "layer3_gemini": bool(GEMINI_KEY)
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
@@ -1290,7 +1300,13 @@ async def debug_ai_test():
         has_image=False,
         existing_customer=None
     )
-    return {"ai_result": result, "openai_key_set": bool(OPENAI_KEY), "base_url": OPENAI_BASE_URL or "default", "available": OPENAI_AVAILABLE}
+    return {
+        "ai_result": result,
+        "layer1_claude": bool(ANTHROPIC_KEY and ANTHROPIC_AVAILABLE),
+        "layer2_openai": bool(OPENAI_KEY),
+        "layer3_gemini": bool(GEMINI_KEY),
+        "openai_base_url": OPENAI_BASE_URL or "default"
+    }
 
 @app.get("/debug/ai-error")
 async def debug_ai_error():
