@@ -769,9 +769,15 @@
     <div class="login-title">Platestory AIR 6</div>
     <div class="login-sub">Sales Intelligence Dashboard</div>
     <input class="login-field" type="email" id="login-email" placeholder="your@platestory.in" autocomplete="email">
-    <input class="login-field" type="password" id="login-password" placeholder="Password" autocomplete="current-password">
+    <div style="position:relative;width:100%;margin-bottom:12px;">
+      <input class="login-field" type="password" id="login-password" placeholder="Password" autocomplete="current-password" style="margin-bottom:0;padding-right:44px;">
+      <button onclick="toggleShowPassword()" type="button" id="show-pass-btn" title="Show / hide password" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:#9aa0a6;font-size:16px;padding:4px;line-height:1;">👁</button>
+    </div>
     <button class="login-btn" onclick="doLogin()">Sign In</button>
     <div class="login-error" id="login-error"></div>
+    <div style="margin-top:14px;text-align:center;">
+      <span style="font-size:12px;color:#9aa0a6;">Forgot password? Ask Vamsi to reset it via Admin panel.</span>
+    </div>
   </div>
 </div>
 
@@ -967,6 +973,19 @@ let allLeads = [];
 let refreshTimer = null;
 
 // ── AUTH ──────────────────────────────────────────────────────────────────────
+function toggleShowPassword() {
+  const inp = document.getElementById('login-password');
+  const btn = document.getElementById('show-pass-btn');
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    btn.style.color = '#e8622a';
+    btn.title = 'Hide password';
+  } else {
+    inp.type = 'password';
+    btn.style.color = '#9aa0a6';
+    btn.title = 'Show password';
+  }
+}
 async function doLogin() {
   const email = document.getElementById('login-email').value.trim();
   const pass  = document.getElementById('login-password').value;
@@ -1481,7 +1500,10 @@ function renderUsers(users) {
       <td>${esc(u.email)}</td>
       <td><span style="color:${u.role==='admin'?'var(--orange)':'var(--text-secondary)'};font-weight:500">${u.role}</span></td>
       <td>${cityEdit}</td>
-      <td>${!isAdmin ? `<button class="act-btn red" onclick="deleteUser(${u.id})">Remove</button>` : ''}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap;">
+        ${!isAdmin ? `<button class="act-btn" onclick="resetUserPassword(${u.id},'${esc(u.name||u.email)}')">Reset Password</button>` : ''}
+        ${!isAdmin ? `<button class="act-btn red" onclick="deleteUser(${u.id})">Remove</button>` : ''}
+      </td>
     </tr>`;
   }).join('');
 }
@@ -1516,6 +1538,18 @@ async function saveCities(id) {
   const r = await put(`/api/v1/auth/users/${id}`, {assigned_cities});
   if (r && r.ok) toast('Cities updated!','success');
   loadDashboard();
+}
+async function resetUserPassword(id, name) {
+  const newPass = prompt(`Reset password for ${name}\nEnter new password (min 6 characters):`);
+  if (!newPass) return;
+  if (newPass.length < 6) { toast('Password must be at least 6 characters','error'); return; }
+  const r = await fetch(`${API}/api/v1/auth/users/${id}/reset-password`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+    body: JSON.stringify({password: newPass})
+  });
+  if (r && r.ok) toast(`Password reset for ${name}!`, 'success');
+  else { const d = await r.json().catch(()=>({})); toast(d.detail || 'Failed to reset password','error'); }
 }
 function showUserForm() { document.getElementById('user-overlay').style.display='flex'; }
 async function submitUser() {

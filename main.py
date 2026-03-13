@@ -562,16 +562,18 @@ class UpdateUserRequest(BaseModel):
 
 @app.post("/api/v1/auth/login")
 def login(req: LoginRequest):
-    if not req.email.endswith("@platestory.in"):
+    # Always lowercase email for case-insensitive login (e.g. Kenneth vs kenneth)
+    email_lower = req.email.strip().lower()
+    if not email_lower.endswith("@platestory.in"):
         raise HTTPException(status_code=403, detail="Only @platestory.in emails")
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE email=?", (req.email,)).fetchone()
+    user = conn.execute("SELECT * FROM users WHERE LOWER(email)=?", (email_lower,)).fetchone()
     if not user or user["password_hash"] != hash_password(req.password):
         conn.close()
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = secrets.token_hex(32)
     conn.execute("INSERT INTO sessions (token,email,role,created_at) VALUES (?,?,?,?)",
-        (token, req.email, user["role"], datetime.utcnow().isoformat()))
+        (token, user["email"], user["role"], datetime.utcnow().isoformat()))
     conn.commit()
     conn.close()
     user_dict = dict(user)
@@ -585,13 +587,15 @@ def login(req: LoginRequest):
 @app.post("/api/v1/auth/register")
 def register(req: RegisterRequest, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
-    if not req.email.endswith("@platestory.in"):
+    # Always store emails in lowercase to prevent case mismatch issues
+    email_lower = req.email.strip().lower()
+    if not email_lower.endswith("@platestory.in"):
         raise HTTPException(status_code=400, detail="Only @platestory.in emails")
     conn = get_db()
     assigned = req.assigned_cities if req.assigned_cities else [req.city]
     try:
         conn.execute("INSERT INTO users (email,password_hash,role,name,city,assigned_cities,created_at) VALUES (?,?,?,?,?,?,?)",
-            (req.email, hash_password(req.password), "salesperson", req.name, req.city, json.dumps(assigned), datetime.utcnow().isoformat()))
+            (email_lower, hash_password(req.password), "salesperson", req.name, req.city, json.dumps(assigned), datetime.utcnow().isoformat()))
         conn.commit()
     except: raise HTTPException(status_code=400, detail="Email already exists")
     finally: conn.close()
@@ -636,6 +640,20 @@ def delete_user(user_id: int, user=Depends(get_current_user)):
 @app.get("/api/v1/auth/me")
 def me(user=Depends(get_current_user)):
     return user
+
+@app.post("/api/v1/auth/users/{user_id}/reset-password")
+def reset_password(user_id: int, req: dict, user=Depends(get_current_user)):
+    """Admin-only: reset any user's password."""
+    if user["role"] != "admin": raise HTTPException(status_code=403)
+    new_password = req.get("password", "").strip()
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    conn = get_db()
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+        (hash_password(new_password), user_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
 
 # ── EXTRACTIONS (SMART UPSERT) ─────────────────────────────────────────────────
 
