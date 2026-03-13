@@ -1326,3 +1326,134 @@ async def debug_ai_error():
         return {"success": True, "response": response.choices[0].message.content}
     except Exception as e:
         return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/admin/reprocess-all")
+async def reprocess_all_leads(background_tasks: BackgroundTasks, credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Re-run AI extraction on ALL existing leads to fill in empty fields. Admin only."""
+    if not credentials:
+        raise HTTPException(status_code=401)
+    conn = get_db()
+    session = conn.execute("SELECT * FROM sessions WHERE token=?", (credentials.credentials,)).fetchone()
+    conn.close()
+    if not session or session["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    background_tasks.add_task(_reprocess_all_background)
+    return {"status": "started", "message": "Reprocessing all leads in background. Check /admin/reprocess-status for progress."}
+
+_reprocess_status = {"total": 0, "done": 0, "errors": 0, "running": False, "started_at": None, "finished_at": None}
+
+async def _reprocess_all_background():
+    global _reprocess_status
+    conn = get_db()
+    leads = conn.execute("SELECT * FROM customers ORDER BY id ASC").fetchall()
+    conn.close()
+
+    _reprocess_status = {
+        "total": len(leads), "done": 0, "errors": 0,
+        "running": True, "started_at": datetime.utcnow().isoformat(), "finished_at": None
+    }
+
+    for lead in leads:
+        try:
+            lead = dict(lead)
+            messages_raw = lead.get("messages", "[]") or "[]"
+            try:
+                msgs = json.loads(messages_raw)
+            except:
+                msgs = []
+
+            # Build combined message text from all stored messages
+            all_text = lead.get("last_message", "") or ""
+            if msgs:
+                all_text = " | ".join(str(m) for m in msgs[-20:])
+
+            if not all_text.strip():
+                _reprocess_status["done"] += 1
+                continue
+
+            ai = await claude_extract(
+                message=all_text,
+                contact_name=lead.get("contact_name", ""),
+                conversation_history=msgs,
+                has_image=bool(lead.get("has_image")),
+                existing_customer=lead
+            )
+
+            if not ai:
+                _reprocess_status["errors"] += 1
+                _reprocess_status["done"] += 1
+                continue
+
+            # Update all AI fields — only overwrite if currently empty/unknown
+            conn2 = get_db()
+            conn2.execute("""UPDATE customers SET
+                cake_type = COALESCE(NULLIF(cake_type,'unknown'), ?),
+                cake_type_confidence = COALESCE(NULLIF(cake_type_confidence,'uncertain'), ?),
+                event_date = COALESCE(NULLIF(event_date,''), ?),
+                event_date_confidence = COALESCE(NULLIF(event_date_confidence,'uncertain'), ?),
+                budget_range = COALESCE(NULLIF(budget_range,''), ?),
+                budget_confidence = COALESCE(NULLIF(budget_confidence,'uncertain'), ?),
+                weight_kg = COALESCE(NULLIF(weight_kg,''), ?),
+                weight_confidence = COALESCE(NULLIF(weight_confidence,'uncertain'), ?),
+                flavour = COALESCE(NULLIF(flavour,''), ?),
+                flavour_confidence = COALESCE(NULLIF(flavour_confidence,'uncertain'), ?),
+                city = COALESCE(NULLIF(city,'unknown'), ?),
+                city_confidence = COALESCE(NULLIF(city_confidence,'uncertain'), ?),
+                occasion_detail = COALESCE(NULLIF(occasion_detail,''), ?),
+                lead_score = COALESCE(NULLIF(lead_score,'WARM'), ?),
+                funnel_stage = COALESCE(NULLIF(funnel_stage,'enquiry'), ?),
+                conversion_status = COALESCE(NULLIF(conversion_status,'open'), ?),
+                conversion_probability = COALESCE(NULLIF(conversion_probability,'low'), ?),
+                business_vertical = COALESCE(NULLIF(business_vertical,'unknown'), ?),
+                estimated_order_value = COALESCE(NULLIF(estimated_order_value,'unknown'), ?),
+                urgency_flag = CASE WHEN urgency_flag=0 THEN ? ELSE urgency_flag END,
+                drop_detected = CASE WHEN drop_detected=0 THEN ? ELSE drop_detected END,
+                next_action = COALESCE(NULLIF(next_action,''), ?),
+                copilot_recommendation = COALESCE(NULLIF(copilot_recommendation,''), ?),
+                notes = COALESCE(NULLIF(notes,''), ?),
+                suggested_reply = COALESCE(NULLIF(suggested_reply,''), ?),
+                last_updated = ?
+                WHERE id = ?""",
+                (
+                    ai.get("cake_type"), ai.get("cake_type_confidence"),
+                    ai.get("event_date"), ai.get("event_date_confidence"),
+                    ai.get("budget_range"), ai.get("budget_confidence"),
+                    ai.get("weight_kg"), ai.get("weight_confidence"),
+                    ai.get("flavour"), ai.get("flavour_confidence"),
+                    ai.get("city"), ai.get("city_confidence"),
+                    ai.get("occasion_detail"),
+                    ai.get("lead_score"),
+                    ai.get("funnel_stage"),
+                    ai.get("conversion_status"),
+                    ai.get("conversion_probability"),
+                    ai.get("business_vertical"),
+                    ai.get("estimated_order_value"),
+                    1 if ai.get("urgency_flag") else 0,
+                    1 if ai.get("drop_detected") else 0,
+                    ai.get("next_action"),
+                    ai.get("copilot_recommendation"),
+                    ai.get("notes"),
+                    ai.get("suggested_reply"),
+                    datetime.utcnow().isoformat(),
+                    lead["id"]
+                )
+            )
+            conn2.commit()
+            conn2.close()
+            _reprocess_status["done"] += 1
+            print(f"Reprocessed lead {lead['id']} ({lead.get('contact_name','?')})")
+
+        except Exception as e:
+            print(f"Error reprocessing lead {lead.get('id')}: {e}")
+            _reprocess_status["errors"] += 1
+            _reprocess_status["done"] += 1
+
+    _reprocess_status["running"] = False
+    _reprocess_status["finished_at"] = datetime.utcnow().isoformat()
+    print(f"Reprocess complete: {_reprocess_status['done']} done, {_reprocess_status['errors']} errors")
+
+@app.get("/admin/reprocess-status")
+async def reprocess_status():
+    """Check the status of the background reprocessing job."""
+    return _reprocess_status
