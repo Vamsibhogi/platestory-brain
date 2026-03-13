@@ -11,6 +11,11 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+try:
+    import anthropic as _anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 from datetime import datetime, date, timedelta
 
 app = FastAPI(title="Platestory AIR 6")
@@ -31,6 +36,7 @@ DB_PATH        = os.getenv("DB_PATH", "/data/platestory.db")
 ADMIN_EMAIL    = "vamsi.bhogi@platestory.in"
 OPENAI_KEY     = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")  # optional proxy base URL
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER      = os.getenv("SMTP_USER", "")
@@ -431,14 +437,10 @@ async def claude_extract(message: str, contact_name: str,
                           conversation_history: list = None,
                           has_image: bool = False,
                           existing_customer: dict = None) -> dict:
-    if not OPENAI_AVAILABLE or not OPENAI_KEY:
+    # Try Anthropic first (real key on Railway), fall back to OpenAI proxy
+    if not (ANTHROPIC_AVAILABLE and ANTHROPIC_KEY) and not (OPENAI_AVAILABLE and OPENAI_KEY):
         return {}
     try:
-        client_kwargs = {"api_key": OPENAI_KEY}
-        if OPENAI_BASE_URL:
-            client_kwargs["base_url"] = OPENAI_BASE_URL
-        client = _OpenAI(**client_kwargs)
-
         # Build conversation context block
         context_block = ""
         if conversation_history:
@@ -534,16 +536,29 @@ Return ONLY valid JSON (no markdown, no explanation):
   "suggested_reply": "natural WhatsApp reply (2-3 sentences, warm, personal, not salesy). Reference what they asked. If city unknown, ask naturally."
 }}"""
 
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            max_tokens=1200,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = response.choices[0].message.content.strip()
+        if ANTHROPIC_AVAILABLE and ANTHROPIC_KEY:
+            ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            ant_response = ant_client.messages.create(
+                model="claude-3-5-haiku-20241022",
+                max_tokens=1200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = ant_response.content[0].text.strip()
+        else:
+            client_kwargs = {"api_key": OPENAI_KEY}
+            if OPENAI_BASE_URL:
+                client_kwargs["base_url"] = OPENAI_BASE_URL
+            oai_client = _OpenAI(**client_kwargs)
+            oai_response = oai_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                max_tokens=1200,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            text = oai_response.choices[0].message.content.strip()
         text = re.sub(r"```json|```", "", text).strip()
         return json.loads(text)
     except Exception as e:
-        print(f"Claude error: {e}")
+        print(f"AI extraction error: {e}")
         return {}
 
 # ── AUTH ───────────────────────────────────────────────────────────────────────
