@@ -722,6 +722,105 @@
   .add-btn:hover { background: #d4551f; }
 
   /* ═══════════════════════════════════════════
+     SYSTEM HEALTH BANNER
+  ═══════════════════════════════════════════ */
+  #system-health-banner {
+    display: none;
+    margin: 0 0 16px 0;
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+  }
+  .health-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 18px;
+    background: var(--surface);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .health-header:hover { border-color: var(--border2); }
+  .health-header.has-alerts { border-color: #d93025; background: #fff8f7; }
+  .health-header.all-ok { border-color: #1e8e3e; background: #f6fdf8; }
+  .health-header.has-warnings { border-color: #e37400; background: #fffbf0; }
+  .health-title {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 600; color: var(--text-primary);
+  }
+  .health-dots { display: flex; gap: 6px; align-items: center; }
+  .health-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .health-dot.ok { background: #1e8e3e; }
+  .health-dot.warning { background: #e37400; }
+  .health-dot.error, .health-dot.no_credits, .health-dot.invalid_key,
+  .health-dot.offline, .health-dot.low_credits { background: #d93025; }
+  .health-dot.unknown { background: #9aa0a6; }
+  .health-expand-btn {
+    font-size: 12px; color: var(--text-secondary);
+    background: none; border: none; cursor: pointer;
+    padding: 2px 8px; border-radius: 6px;
+    transition: background 0.15s;
+  }
+  .health-expand-btn:hover { background: var(--bg2); }
+  .health-panel {
+    display: none;
+    background: var(--surface);
+    border: 1.5px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+    padding: 0;
+    overflow: hidden;
+  }
+  .health-panel.open { display: block; }
+  .health-row {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .health-row:last-child { border-bottom: none; }
+  .health-row-name {
+    font-weight: 600; min-width: 180px; color: var(--text-primary);
+    display: flex; align-items: center; gap: 7px;
+  }
+  .health-row-detail { color: var(--text-secondary); flex: 1; }
+  .health-badge {
+    font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: 10px; white-space: nowrap; flex-shrink: 0;
+  }
+  .health-badge.ok { background: var(--green-bg); color: var(--green); }
+  .health-badge.warning { background: var(--warm-bg); color: var(--warm); }
+  .health-badge.no_credits, .health-badge.low_credits {
+    background: var(--hot-bg); color: var(--hot);
+  }
+  .health-badge.invalid_key, .health-badge.error {
+    background: var(--hot-bg); color: var(--hot);
+  }
+  .health-badge.offline { background: var(--hot-bg); color: var(--hot); }
+  .health-badge.unknown { background: var(--grey-bg); color: var(--grey); }
+  .health-link {
+    font-size: 11px; color: var(--orange); text-decoration: none;
+    margin-left: 6px; font-weight: 500;
+  }
+  .health-link:hover { text-decoration: underline; }
+  .health-last-checked {
+    font-size: 11px; color: var(--text-tertiary); padding: 8px 18px;
+    border-top: 1px solid var(--border); background: var(--bg);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .health-refresh-btn {
+    font-size: 11px; color: var(--orange); background: none;
+    border: none; cursor: pointer; font-family: var(--font);
+    font-weight: 500; padding: 2px 6px;
+  }
+  .health-refresh-btn:hover { text-decoration: underline; }
+
+  /* ═══════════════════════════════════════════
      TOAST
   ═══════════════════════════════════════════ */
   .toast {
@@ -819,6 +918,28 @@
   </div>
 
   <div class="main">
+    <!-- System Health Banner -->
+    <div id="system-health-banner">
+      <div class="health-header" id="health-header" onclick="toggleHealthPanel()">
+        <div class="health-title">
+          <span id="health-icon">🔄</span>
+          <span id="health-title-text">System Health</span>
+          <div class="health-dots" id="health-dots"></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <span id="health-alert-count" style="font-size:12px;color:var(--text-secondary);"></span>
+          <button class="health-expand-btn" id="health-expand-btn">Details ▾</button>
+        </div>
+      </div>
+      <div class="health-panel" id="health-panel">
+        <div id="health-rows"></div>
+        <div class="health-last-checked">
+          <span id="health-last-checked-time">Checking...</span>
+          <button class="health-refresh-btn" onclick="loadSystemHealth()">↻ Refresh</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Stats -->
     <div class="stats-row" id="stats-row"></div>
     <!-- Pipeline -->
@@ -1035,6 +1156,100 @@ function doLogout() {
   document.getElementById('login-screen').style.display = 'flex';
 }
 
+// ── SYSTEM HEALTH ────────────────────────────────────────────────────────────
+let healthPanelOpen = false;
+let healthCheckTimer = null;
+
+const HEALTH_ICONS = {
+  claude: '🤖', openai: '🧠', gemini: '✨',
+  railway: '🚂', database: '🗄️', extension: '📱'
+};
+const HEALTH_LINKS = {
+  claude: { no_credits: 'https://console.anthropic.com/settings/billing', invalid_key: 'https://console.anthropic.com/settings/keys' },
+  openai: { no_credits: 'https://platform.openai.com/account/billing', invalid_key: 'https://platform.openai.com/api-keys' },
+  gemini: { no_credits: 'https://aistudio.google.com/', invalid_key: 'https://aistudio.google.com/app/apikey' },
+  railway: { low_credits: 'https://railway.com/account/billing', warning: 'https://railway.com/account/billing' }
+};
+const HEALTH_STATUS_LABELS = {
+  ok: '✅ OK', warning: '⚠️ Warning', no_credits: '🔴 No Credits',
+  low_credits: '🔴 Low Credits', invalid_key: '🔴 Invalid Key',
+  error: '🔴 Error', offline: '🔴 Offline', unknown: '⬜ Unknown'
+};
+
+async function loadSystemHealth() {
+  const banner = document.getElementById('system-health-banner');
+  const header = document.getElementById('health-header');
+  const titleText = document.getElementById('health-title-text');
+  const icon = document.getElementById('health-icon');
+  const dotsEl = document.getElementById('health-dots');
+  const alertCount = document.getElementById('health-alert-count');
+  const rowsEl = document.getElementById('health-rows');
+  const lastChecked = document.getElementById('health-last-checked-time');
+
+  icon.textContent = '🔄';
+  titleText.textContent = 'Checking system health...';
+  banner.style.display = 'block';
+
+  try {
+    const r = await fetch(`${API}/health/system`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (!r.ok) throw new Error('Health check failed');
+    const data = await r.json();
+
+    const components = data.components || {};
+    const overall = data.overall || 'unknown';
+    const alerts = data.alerts || [];
+    const checkedAt = data.checked_at ? new Date(data.checked_at + 'Z').toLocaleTimeString() : 'now';
+
+    // Update header
+    header.className = 'health-header ' + (overall === 'ok' ? 'all-ok' : overall === 'warning' ? 'has-warnings' : 'has-alerts');
+    icon.textContent = overall === 'ok' ? '✅' : overall === 'warning' ? '⚠️' : '🔴';
+    titleText.textContent = overall === 'ok' ? 'All Systems Operational' : overall === 'warning' ? 'System Warning' : 'System Alert — Action Required';
+    alertCount.textContent = alerts.length > 0 ? `${alerts.length} issue${alerts.length > 1 ? 's' : ''} detected` : '';
+    lastChecked.textContent = `Last checked: ${checkedAt}`;
+
+    // Dots
+    dotsEl.innerHTML = Object.entries(components).map(([k, v]) =>
+      `<div class="health-dot ${v.status}" title="${v.name}: ${v.status}"></div>`
+    ).join('');
+
+    // Rows
+    rowsEl.innerHTML = Object.entries(components).map(([key, comp]) => {
+      const linkMap = HEALTH_LINKS[key] || {};
+      const link = linkMap[comp.status];
+      const linkHtml = link ? `<a class="health-link" href="${link}" target="_blank">Fix now →</a>` : '';
+      return `
+        <div class="health-row">
+          <div class="health-row-name">
+            <span>${HEALTH_ICONS[key] || '⚙️'}</span>
+            ${comp.name}
+          </div>
+          <div class="health-row-detail">${comp.detail || ''}${linkHtml}</div>
+          <span class="health-badge ${comp.status}">${HEALTH_STATUS_LABELS[comp.status] || comp.status}</span>
+        </div>`;
+    }).join('');
+
+    // Auto-expand if there are alerts
+    if (overall !== 'ok' && !healthPanelOpen) {
+      document.getElementById('health-panel').classList.add('open');
+      document.getElementById('health-expand-btn').textContent = 'Hide ▴';
+      healthPanelOpen = true;
+    }
+
+  } catch(e) {
+    icon.textContent = '⚠️';
+    titleText.textContent = 'Could not reach health endpoint';
+    console.error('Health check error:', e);
+  }
+}
+
+function toggleHealthPanel() {
+  healthPanelOpen = !healthPanelOpen;
+  document.getElementById('health-panel').classList.toggle('open', healthPanelOpen);
+  document.getElementById('health-expand-btn').textContent = healthPanelOpen ? 'Hide ▴' : 'Details ▾';
+}
+
 function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'block';
@@ -1057,7 +1272,10 @@ function showApp() {
   }
   loadDashboard();
   loadB2B();
+  loadSystemHealth();
   refreshTimer = setInterval(() => { loadDashboard(); loadB2B(); }, 30000);
+  // Refresh system health every 5 minutes
+  healthCheckTimer = setInterval(() => { loadSystemHealth(); }, 5 * 60 * 1000);
 }
 
 // ── NAV ───────────────────────────────────────────────────────────────────────

@@ -390,8 +390,27 @@ def parse_cake_type(message: str) -> Optional[str]:
         if any(k in msg for k in kws): return ct
     return None
 
+DROP_SIGNALS = [
+    "change our plans", "changed our plans", "change my plans", "changed my plans",
+    "cancel", "cancelled", "not required", "not needed", "nevermind", "never mind",
+    "will manage", "will manage elsewhere", "found someone else", "going with someone else",
+    "not interested", "no longer interested", "don't need", "dont need",
+    "sorry we", "sorry i", "sorry, we", "sorry, i",
+    "plans changed", "plan changed", "event cancelled", "event canceled",
+    "no need", "not going ahead", "not proceeding", "decided not to",
+    "won't be needing", "wont be needing", "won't need", "wont need",
+    "thanks but", "thank you but", "managed it", "already managed",
+    "went with another", "chose another", "chose someone else",
+]
+
+def detect_drop(message: str) -> bool:
+    """Returns True if message contains a clear drop/cancellation signal."""
+    msg = message.lower()
+    return any(signal in msg for signal in DROP_SIGNALS)
+
 def parse_lead_score(message: str) -> str:
     msg = message.lower()
+    if detect_drop(msg): return "COLD"
     if any(w in msg for w in ["urgent","asap","today","tomorrow","this week","confirmed","book","advance","payment","upi","gpay"]): return "HOT"
     if any(w in msg for w in ["maybe","will think","let me check","not sure","budget issue","too expensive","costly"]): return "COLD"
     return "WARM"
@@ -545,12 +564,12 @@ Return ONLY valid JSON (no markdown, no explanation):
             try:
                 ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
                 ant_response = ant_client.messages.create(
-                    model="claude-3-5-haiku-20241022",
+                    model="claude-haiku-4-5",
                     max_tokens=1200,
                     messages=[{"role": "user", "content": prompt}]
                 )
                 text = ant_response.content[0].text.strip()
-                print("AI: Claude 3.5 Haiku succeeded")
+                print("AI: Claude Haiku 4.5 succeeded")
             except Exception as e:
                 last_error = e
                 print(f"AI Layer 1 (Claude) failed: {e}")
@@ -810,6 +829,16 @@ async def extract(req: Request, background_tasks: BackgroundTasks):
 
         if has_image and funnel_stage == "enquiry":
             funnel_stage = "ref_shared"
+
+        # ── Drop detection: regex fallback (catches what AI misses) ──────────────
+        # Check the FULL conversation history for drop signals, not just last message
+        full_conv_text = " ".join(history).lower()
+        if detect_drop(full_conv_text):
+            drop_detected = True
+            conv_status = "dropped"
+            lead_score = "COLD"
+            funnel_stage = "dropped"
+        # ─────────────────────────────────────────────────────────────────────────
 
         # Event within 3 days = urgent
         if event_date:
@@ -1286,6 +1315,212 @@ def health():
         }
     }
 
+@app.get("/health/system")
+async def system_health():
+    """
+    Full system health check for Platestory AIR 6.
+    Live-tests all 3 AI layers, checks DB, pipeline stats, and Railway credits.
+    """
+    import time, httpx
+    result = {
+        "checked_at": datetime.utcnow().isoformat(),
+        "components": {}
+    }
+
+    # ── 1. Claude (Anthropic) ────────────────────────────────────────────────
+    claude_status = {"name": "Claude (Anthropic)", "ok": False, "status": "unknown", "detail": ""}
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_KEY:
+        claude_status["status"] = "error"
+        claude_status["detail"] = "Key not configured"
+    else:
+        try:
+            ant_client = _anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            ant_client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            claude_status["ok"] = True
+            claude_status["status"] = "ok"
+            claude_status["detail"] = "Credits available"
+        except Exception as e:
+            err = str(e)
+            if "credit" in err.lower() or "quota" in err.lower() or "billing" in err.lower():
+                claude_status["status"] = "no_credits"
+                claude_status["detail"] = "Credits exhausted — top up at console.anthropic.com"
+            elif "auth" in err.lower() or "401" in err or "invalid" in err.lower():
+                claude_status["status"] = "invalid_key"
+                claude_status["detail"] = "API key invalid or expired"
+            else:
+                claude_status["status"] = "error"
+                claude_status["detail"] = err[:120]
+    result["components"]["claude"] = claude_status
+
+    # ── 2. OpenAI (GPT) ─────────────────────────────────────────────────────
+    openai_status = {"name": "OpenAI (GPT-4.1 Mini)", "ok": False, "status": "unknown", "detail": ""}
+    if not OPENAI_AVAILABLE or not OPENAI_KEY:
+        openai_status["status"] = "error"
+        openai_status["detail"] = "Key not configured"
+    else:
+        try:
+            from openai import OpenAI as _OAI
+            oai = _OAI(api_key=OPENAI_KEY, base_url="https://api.openai.com/v1")
+            oai.chat.completions.create(
+                model="gpt-4.1-mini",
+                max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            openai_status["ok"] = True
+            openai_status["status"] = "ok"
+            openai_status["detail"] = "Credits available"
+        except Exception as e:
+            err = str(e)
+            if "quota" in err.lower() or "billing" in err.lower() or "insufficient" in err.lower():
+                openai_status["status"] = "no_credits"
+                openai_status["detail"] = "Quota exceeded — top up at platform.openai.com"
+            elif "auth" in err.lower() or "401" in err or "invalid" in err.lower():
+                openai_status["status"] = "invalid_key"
+                openai_status["detail"] = "API key invalid or expired"
+            else:
+                openai_status["status"] = "error"
+                openai_status["detail"] = err[:120]
+    result["components"]["openai"] = openai_status
+
+    # ── 3. Gemini ────────────────────────────────────────────────────────────
+    gemini_status = {"name": "Gemini (Google)", "ok": False, "status": "unknown", "detail": ""}
+    if not GEMINI_KEY:
+        gemini_status["status"] = "error"
+        gemini_status["detail"] = "Key not configured"
+    else:
+        try:
+            from openai import OpenAI as _OAI
+            gem = _OAI(
+                api_key=GEMINI_KEY,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+            )
+            gem.chat.completions.create(
+                model="gemini-2.0-flash",
+                max_tokens=5,
+                messages=[{"role": "user", "content": "ping"}]
+            )
+            gemini_status["ok"] = True
+            gemini_status["status"] = "ok"
+            gemini_status["detail"] = "Credits available"
+        except Exception as e:
+            err = str(e)
+            if "quota" in err.lower() or "429" in err or "resource" in err.lower():
+                gemini_status["status"] = "no_credits"
+                gemini_status["detail"] = "Quota exceeded — check aistudio.google.com"
+            elif "auth" in err.lower() or "401" in err or "invalid" in err.lower() or "api_key" in err.lower():
+                gemini_status["status"] = "invalid_key"
+                gemini_status["detail"] = "API key invalid or expired"
+            else:
+                gemini_status["status"] = "error"
+                gemini_status["detail"] = err[:120]
+    result["components"]["gemini"] = gemini_status
+
+    # ── 4. Railway Credits ───────────────────────────────────────────────────
+    railway_status = {"name": "Railway Hosting", "ok": True, "status": "ok", "detail": ""}
+    railway_token = os.environ.get("RAILWAY_TOKEN", "")
+    if railway_token:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.post(
+                    "https://backboard.railway.app/graphql/v2",
+                    headers={"Authorization": f"Bearer {railway_token}", "Content-Type": "application/json"},
+                    json={"query": "{ me { creditBalance } }"}
+                )
+                data = resp.json()
+                balance = data.get("data", {}).get("me", {}).get("creditBalance", None)
+                if balance is not None:
+                    dollars = round(balance / 100, 2)
+                    railway_status["detail"] = f"${dollars} credits remaining"
+                    if dollars < 2.0:
+                        railway_status["ok"] = False
+                        railway_status["status"] = "low_credits"
+                        railway_status["detail"] = f"CRITICAL: Only ${dollars} left — top up at railway.com/account/billing"
+                    elif dollars < 5.0:
+                        railway_status["status"] = "warning"
+                        railway_status["detail"] = f"WARNING: Only ${dollars} left — consider topping up soon"
+                    else:
+                        railway_status["status"] = "ok"
+                else:
+                    railway_status["detail"] = "Could not fetch balance (check RAILWAY_TOKEN)"
+        except Exception as e:
+            railway_status["detail"] = f"Could not fetch Railway credits: {str(e)[:80]}"
+    else:
+        railway_status["detail"] = "RAILWAY_TOKEN not set — add it to Railway env vars to monitor credits"
+        railway_status["status"] = "warning"
+    result["components"]["railway"] = railway_status
+
+    # ── 5. Database & Backend ────────────────────────────────────────────────
+    db_status = {"name": "Database & Backend", "ok": False, "status": "unknown", "detail": ""}
+    try:
+        conn = get_db()
+        total = conn.execute("SELECT COUNT(*) as c FROM customers").fetchone()["c"]
+        last_msg = conn.execute(
+            "SELECT last_updated FROM customers ORDER BY last_updated DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        db_status["ok"] = True
+        db_status["status"] = "ok"
+        last_ts = last_msg["last_updated"] if last_msg else "never"
+        db_status["detail"] = f"{total} leads stored. Last activity: {last_ts[:16] if last_ts else 'none'}"
+    except Exception as e:
+        db_status["status"] = "error"
+        db_status["detail"] = str(e)[:120]
+    result["components"]["database"] = db_status
+
+    # ── 6. Extension Connectivity ────────────────────────────────────────────
+    ext_status = {"name": "WhatsApp Extension", "ok": False, "status": "unknown", "detail": ""}
+    try:
+        conn = get_db()
+        last_row = conn.execute(
+            "SELECT last_updated FROM customers ORDER BY last_updated DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if last_row:
+            last_ts_str = last_row["last_updated"]
+            try:
+                last_dt = datetime.fromisoformat(last_ts_str)
+                hours_ago = (datetime.utcnow() - last_dt).total_seconds() / 3600
+                if hours_ago < 2:
+                    ext_status["ok"] = True
+                    ext_status["status"] = "ok"
+                    ext_status["detail"] = f"Last message {int(hours_ago*60)} minutes ago — extension active"
+                elif hours_ago < 24:
+                    ext_status["ok"] = True
+                    ext_status["status"] = "warning"
+                    ext_status["detail"] = f"Last message {int(hours_ago)} hours ago — extension may be idle"
+                else:
+                    ext_status["status"] = "offline"
+                    ext_status["detail"] = f"No messages in {int(hours_ago)} hours — check if extension is running on WhatsApp Web"
+            except:
+                ext_status["status"] = "warning"
+                ext_status["detail"] = "Could not parse last activity timestamp"
+        else:
+            ext_status["status"] = "warning"
+            ext_status["detail"] = "No leads yet — extension may not be connected"
+    except Exception as e:
+        ext_status["status"] = "error"
+        ext_status["detail"] = str(e)[:120]
+    result["components"]["extension"] = ext_status
+
+    # ── Overall system status ────────────────────────────────────────────────
+    all_ok = all(v["ok"] for v in result["components"].values())
+    any_critical = any(
+        v["status"] in ["no_credits", "invalid_key", "error", "offline", "low_credits"]
+        for v in result["components"].values()
+    )
+    result["overall"] = "ok" if all_ok else ("critical" if any_critical else "warning")
+    result["alerts"] = [
+        {"component": k, "message": v["detail"]}
+        for k, v in result["components"].items()
+        if not v["ok"]
+    ]
+    return result
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
@@ -1385,10 +1620,20 @@ async def _reprocess_all_background():
                 _reprocess_status["done"] += 1
                 continue
 
-            # Update all AI fields — only overwrite if currently empty/unknown
+            # Apply drop detection on full conversation
+            full_conv_text = " ".join(str(m) for m in msgs).lower()
+            is_dropped = detect_drop(full_conv_text)
+            if is_dropped:
+                ai["drop_detected"] = True
+                ai["conversion_status"] = "dropped"
+                ai["lead_score"] = "COLD"
+                ai["funnel_stage"] = "dropped"
+
+            # Update all AI fields — overwrite empty/unknown fields with AI results
             conn2 = get_db()
-            conn2.execute("""UPDATE customers SET
-                cake_type = COALESCE(NULLIF(cake_type,'unknown'), ?),
+            conn2.execute(
+                """UPDATE customers SET
+                cake_type = COALESCE(NULLIF(cake_type,'unknown'), NULLIF(cake_type,''), ?),
                 cake_type_confidence = COALESCE(NULLIF(cake_type_confidence,'uncertain'), ?),
                 event_date = COALESCE(NULLIF(event_date,''), ?),
                 event_date_confidence = COALESCE(NULLIF(event_date_confidence,'uncertain'), ?),
@@ -1398,17 +1643,17 @@ async def _reprocess_all_background():
                 weight_confidence = COALESCE(NULLIF(weight_confidence,'uncertain'), ?),
                 flavour = COALESCE(NULLIF(flavour,''), ?),
                 flavour_confidence = COALESCE(NULLIF(flavour_confidence,'uncertain'), ?),
-                city = COALESCE(NULLIF(city,'unknown'), ?),
+                city = COALESCE(NULLIF(city,'unknown'), NULLIF(city,''), ?),
                 city_confidence = COALESCE(NULLIF(city_confidence,'uncertain'), ?),
                 occasion_detail = COALESCE(NULLIF(occasion_detail,''), ?),
-                lead_score = COALESCE(NULLIF(lead_score,'WARM'), ?),
-                funnel_stage = COALESCE(NULLIF(funnel_stage,'enquiry'), ?),
-                conversion_status = COALESCE(NULLIF(conversion_status,'open'), ?),
+                lead_score = CASE WHEN ? IS NOT NULL THEN ? ELSE lead_score END,
+                funnel_stage = CASE WHEN ? IS NOT NULL THEN ? ELSE funnel_stage END,
+                conversion_status = CASE WHEN ? IS NOT NULL THEN ? ELSE conversion_status END,
                 conversion_probability = COALESCE(NULLIF(conversion_probability,'low'), ?),
-                business_vertical = COALESCE(NULLIF(business_vertical,'unknown'), ?),
-                estimated_order_value = COALESCE(NULLIF(estimated_order_value,'unknown'), ?),
+                business_vertical = COALESCE(NULLIF(business_vertical,'unknown'), NULLIF(business_vertical,''), ?),
+                estimated_order_value = COALESCE(NULLIF(estimated_order_value,'unknown'), NULLIF(estimated_order_value,''), ?),
                 urgency_flag = CASE WHEN urgency_flag=0 THEN ? ELSE urgency_flag END,
-                drop_detected = CASE WHEN drop_detected=0 THEN ? ELSE drop_detected END,
+                drop_detected = CASE WHEN ? = 1 THEN 1 ELSE drop_detected END,
                 next_action = COALESCE(NULLIF(next_action,''), ?),
                 copilot_recommendation = COALESCE(NULLIF(copilot_recommendation,''), ?),
                 notes = COALESCE(NULLIF(notes,''), ?),
@@ -1423,9 +1668,10 @@ async def _reprocess_all_background():
                     ai.get("flavour"), ai.get("flavour_confidence"),
                     ai.get("city"), ai.get("city_confidence"),
                     ai.get("occasion_detail"),
-                    ai.get("lead_score"),
-                    ai.get("funnel_stage"),
-                    ai.get("conversion_status"),
+                    # CASE WHEN ? IS NOT NULL THEN ? — each needs 2 params
+                    ai.get("lead_score"), ai.get("lead_score"),
+                    ai.get("funnel_stage"), ai.get("funnel_stage"),
+                    ai.get("conversion_status"), ai.get("conversion_status"),
                     ai.get("conversion_probability"),
                     ai.get("business_vertical"),
                     ai.get("estimated_order_value"),
